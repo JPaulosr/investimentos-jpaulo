@@ -1,4 +1,4 @@
-# pages/0_🧠_Insights_&_Alertas.py — feed limpo de Insights & Alertas
+# pages/0_🧠_Insights_&_Alertas.py — feed limpo + ordenação corrigida
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -136,6 +136,7 @@ with st.sidebar:
     topN_conc = st.slider("Top-N p/ concentração", 3, 10, 5)
     alvo_conc = st.slider("Limite de concentração Top-N (%)", 20, 90, 40)
     alvo_yoc  = st.number_input("Meta Yield on Cost (a.a. %)", value=8.0, step=0.5)
+    st.session_state["yoc_meta"] = alvo_yoc
 
 # ------------------ Séries mensais ------------------
 PVm = PV.dropna(subset=["Data"]).copy()
@@ -158,13 +159,12 @@ janela12 = ultima_comp - pd.DateOffset(months=12)
 
 # ------------------ Geração de sinais ------------------
 rows = []
-
 def add_signal(cat, tipo, ticker, score, msg):
     rows.append({
         "categoria": cat,      # "Alerta", "Sinal", "Obs"
         "tipo": tipo,          # queda_mensal, alta_mensal, etc.
         "ticker": ticker,
-        "score": score,        # severidade (0..1)
+        "score": float(score) if pd.notna(score) else 0.0,  # garantir numérico
         "mensagem": msg
     })
 
@@ -240,34 +240,48 @@ if feed.empty:
     st.success("Nenhum insight no momento. 👍")
     st.stop()
 
-# ------------------ Controles de visual ------------------
-with st.container():
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Alertas", int((feed["categoria"]=="Alerta").sum()))
-    col2.metric("Sinais",  int((feed["categoria"]=="Sinal").sum()))
-    col3.metric("Observações", int((feed["categoria"]=="Obs").sum()))
+# ------------------ KPIs topo ------------------
+col1, col2, col3 = st.columns(3)
+col1.metric("Alertas", int((feed["categoria"]=="Alerta").sum()))
+col2.metric("Sinais",  int((feed["categoria"]=="Sinal").sum()))
+col3.metric("Observações", int((feed["categoria"]=="Obs").sum()))
 
 st.divider()
 st.subheader("Feed")
 
+# ------------------ Controles de visual ------------------
 colf1, colf2, colf3 = st.columns([1,1,1.2])
 sev_min = colf1.slider("Severidade mínima", 0.0, 1.0, 0.2, 0.05)
 cats = colf2.multiselect("Categorias", ["Alerta","Sinal","Obs"], default=["Alerta","Sinal","Obs"])
 busca = colf3.text_input("Buscar ticker (ex.: HGLG11)", "").strip().upper()
 
-# aplica filtros
+# aplica filtros (com patch do sort)
 view = feed.copy()
+view["score"] = pd.to_numeric(view.get("score", 0), errors="coerce").fillna(0.0)
 view = view[view["score"] >= sev_min]
 view = view[view["categoria"].isin(cats)]
 if busca:
-    view = view[view["ticker"].str.contains(busca)]
+    view = view[view["ticker"].str.contains(busca, na=False)]
 
-# ordena por severidade (desc) e tipo
-ordem_tipo = {"queda_mensal":0,"desvio_media":1,"sem_pagar":2,"concentracao":3,"alta_mensal":4,"novo_min":5,"novo_max":6,"yoc_ok":7,"yield_atual":8}
-view = view.sort_values(["categoria", view["tipo"].map(ordem_tipo).fillna(99), "score"], ascending=[True, True, False])
+# --- ordenação segura por tipo ---
+ordem_tipo = {
+    "queda_mensal": 0, "desvio_media": 1, "sem_pagar": 2, "concentracao": 3,
+    "alta_mensal": 4, "novo_min": 5, "novo_max": 6, "yoc_ok": 7, "yield_atual": 8
+}
+view["ordem_tipo"] = view["tipo"].map(ordem_tipo).fillna(99).astype(int)
+view = view.sort_values(
+    by=["categoria", "ordem_tipo", "score"],
+    ascending=[True, True, False],
+    kind="mergesort"  # estável
+).reset_index(drop=True)
 
-# abas por categoria
-tab_alerta, tab_sinal, tab_obs = st.tabs(["⚠️ Alertas", "🎉 Sinais", "ℹ️ Observações"])
+# contadores por categoria (para mostrar nas abas)
+n_alert = int((view["categoria"]=="Alerta").sum())
+n_sinal = int((view["categoria"]=="Sinal").sum())
+n_obs   = int((view["categoria"]=="Obs").sum())
+
+# abas por categoria (com contadores)
+tab_alerta, tab_sinal, tab_obs = st.tabs([f"⚠️ Alertas ({n_alert})", f"🎉 Sinais ({n_sinal})", f"ℹ️ Observações ({n_obs})"])
 
 def render_feed(df, empty_msg):
     if df.empty:
@@ -289,7 +303,7 @@ with tab_obs:
 
 st.download_button(
     "⬇️ Exportar feed filtrado (CSV)",
-    view.to_csv(index=False).encode("utf-8-sig"),
+    view.drop(columns=["ordem_tipo"]).to_csv(index=False).encode("utf-8-sig"),
     "insights_filtrados.csv",
     "text/csv"
 )
@@ -307,10 +321,12 @@ mom_tab["MoM%"] = (mom_tab["MoM"]*100).round(1)
 colA, colB, colC = st.columns(3)
 with colA:
     st.caption("🔻 Maiores quedas (MoM)")
-    st.dataframe(mom_tab.sort_values("MoM").head(10)[["Ticker","MoM%"]], hide_index=True, use_container_width=True)
+    st.dataframe(mom_tab.sort_values("MoM").head(10)[["Ticker","MoM%"]],
+                 hide_index=True, use_container_width=True)
 with colB:
     st.caption("📈 Maiores altas (MoM)")
-    st.dataframe(mom_tab.sort_values("MoM", ascending=False).head(10)[["Ticker","MoM%"]], hide_index=True, use_container_width=True)
+    st.dataframe(mom_tab.sort_values("MoM", ascending=False).head(10)[["Ticker","MoM%"]],
+                 hide_index=True, use_container_width=True)
 with colC:
     st.caption("⏰ Sem pagar (gap ≥ parâmetro)")
     gaps = []
@@ -320,4 +336,5 @@ with colC:
         gap = (ultima_comp.to_period("M") - last_pay.to_period("M")).n
         if gap >= meses_sem_pagar:
             gaps.append({"Ticker": tkr, "Meses": gap})
-    st.dataframe(pd.DataFrame(gaps).sort_values("Meses", ascending=False), hide_index=True, use_container_width=True)
+    st.dataframe(pd.DataFrame(gaps).sort_values("Meses", ascending=False),
+                 hide_index=True, use_container_width=True)
