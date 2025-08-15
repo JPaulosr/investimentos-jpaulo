@@ -1,10 +1,10 @@
-# app_investimentos_linkado.py — versão robusta e completa
-# --------------------------------------------------------
-# - Lê via Service Account (gspread) como prioridade
-# - Fallback para CSV por GID ou por NOME (se a planilha estiver pública)
-# - Diagnóstico mostra e-mail da SA, lista de abas e "como cada aba foi lida"
-# - Padroniza colunas (datas BR e números BR)
-# - Filtros seguros + gráficos (carteira, aportes e proventos)
+# app_investimentos_linkado.py — versão integrada (SA + header inteligente)
+# -------------------------------------------------------------------------
+# - Prioriza Service Account (gspread) e cai para CSV somente se público
+# - Detecta a LINHA DE CABEÇALHO por palavras‑chave (Ticker/Tipo/Data…)
+#   * Especial: "3. Proventos" tem 2 linhas acima do header → resolvido
+# - Padroniza Lançamentos e Proventos (Unitário R$, Total Líquido R$, Classe do Ativo)
+# - Gráficos e filtros como antes + diagnóstico
 
 import streamlit as st
 import pandas as pd
@@ -17,24 +17,23 @@ st.set_page_config(page_title="📈 Investimentos – Linkado ao Google Sheets",
 st.title("📈 Painel de Investimentos – Linkado ao Google Sheets")
 PLOTLY_TEMPLATE = "plotly_dark"
 
-# ======================================================
-# Secrets / Config (pode definir aqui ou em st.secrets)
-# ======================================================
+# =============================================================================
+# Config / secrets
+# =============================================================================
 SHEET_ID = st.secrets.get("SHEET_ID", "").strip()
 
-# nomes das abas (padrão compatível com sua planilha)
 ABA_ATIVOS      = st.secrets.get("ABA_ATIVOS", "1. Meus Ativos")
 ABA_LANCAMENTOS = st.secrets.get("ABA_LANCAMENTOS", "2. Lançamentos (B3)")
 ABA_PROVENTOS   = st.secrets.get("ABA_PROVENTOS", "3. Proventos")
 
-# GIDs opcionais (apenas se quiser usar CSV público como fallback)
+# GIDs (opcionais, só para fallback CSV público)
 ABA_ATIVOS_GID      = str(st.secrets.get("ABA_ATIVOS_GID", "")).strip()
 ABA_LANCAMENTOS_GID = str(st.secrets.get("ABA_LANCAMENTOS_GID", "")).strip()
 ABA_PROVENTOS_GID   = str(st.secrets.get("ABA_PROVENTOS_GID", "")).strip()
 
-# ======================================================
-# Helpers de conversão
-# ======================================================
+# =============================================================================
+# Helpers numéricos / datas
+# =============================================================================
 def br_to_float(x):
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return None
@@ -61,17 +60,38 @@ def moeda_br(v):
         v = 0.0
     return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-# ======================================================
-# Service Account (SA) utils + leitores com patch
-# ======================================================
+# =============================================================================
+# Leitura com Service Account (prioritário) + CSV fallback
+# =============================================================================
 def _has_sa():
     return bool(st.secrets.get("GCP_SERVICE_ACCOUNT") or st.secrets.get("gcp_service_account"))
 
 def _get_sa_info():
     return st.secrets.get("GCP_SERVICE_ACCOUNT") or st.secrets.get("gcp_service_account") or {}
 
+def _find_header_row(values, expect_cols):
+    """
+    Dado 'values' (lista de linhas), retorna o índice da linha que melhor parece ser o cabeçalho.
+    expect_cols: lista de possíveis nomes esperados (ex: ["Ticker", "Tipo Provento", "Data"]).
+    Critério: linha que contenha >=2 itens de expect_cols (case-insensitive).
+    """
+    exp = [e.strip().lower() for e in expect_cols]
+    best = None
+    best_hits = 0
+    for i, row in enumerate(values):
+        row_low = [str(c).strip().lower() for c in row]
+        hits = sum(1 for e in exp if e in row_low)
+        if hits > best_hits:
+            best_hits, best = hits, i
+        if hits >= 2:  # suficiente para decidir rápido
+            return i
+    return best if best is not None else 0
+
 def _read_ws_values(sheet_id: str, aba_nome: str) -> pd.DataFrame:
-    """Lê pelo gspread usando Service Account e monta DataFrame robusto."""
+    """
+    Lê uma worksheet com gspread e reconstrói o DataFrame detectando a linha do header.
+    Usa palavras‑chave específicas por aba para acertar "3. Proventos".
+    """
     import gspread
     from google.oauth2.service_account import Credentials
 
@@ -87,7 +107,6 @@ def _read_ws_values(sheet_id: str, aba_nome: str) -> pd.DataFrame:
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(sheet_id)
 
-    # tenta por nome exato; se falhar, aproxima case-insensitive
     try:
         ws = sh.worksheet(aba_nome)
     except Exception:
@@ -101,16 +120,17 @@ def _read_ws_values(sheet_id: str, aba_nome: str) -> pd.DataFrame:
     if not values:
         return pd.DataFrame()
 
-    # primeira linha com >=2 células não vazias vira cabeçalho
-    header_idx = None
-    for i, row in enumerate(values):
-        if sum(1 for c in row if str(c).strip()) >= 2:
-            header_idx = i
-            break
-    if header_idx is None:
-        return pd.DataFrame()
+    # palavras‑chave por aba
+    if "proventos" in ws.title.lower():
+        expect = ["Ticker", "Tipo Provento", "Data"]
+    elif "lançamento" in ws.title.lower() or "lancamento" in ws.title.lower():
+        expect = ["Ticker", "Data", "Tipo", "Tipo de Operação"]
+    else:
+        expect = [c for c in values[0] if str(c).strip()]
 
+    header_idx = _find_header_row(values, expect)
     headers_raw = [h.strip() for h in values[header_idx]]
+    # tratar duplicados/vazios
     seen, headers = {}, []
     for h in headers_raw:
         base = h if h else "col"
@@ -122,20 +142,19 @@ def _read_ws_values(sheet_id: str, aba_nome: str) -> pd.DataFrame:
     return df
 
 def _read_csv_by_gid(sheet_id: str, gid: str) -> pd.DataFrame:
-    import urllib.error
+    import urllib.error, pandas as pd
     try:
         url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
         return pd.read_csv(url)
     except urllib.error.HTTPError as e:
-        # 401/403 => planilha não pública para CSV
-        if e.code in (401, 403):
+        if e.code in (401, 403):  # não pública
             return pd.DataFrame()
         raise
     except Exception:
         return pd.DataFrame()
 
 def _read_csv_by_name(sheet_id: str, aba_nome: str) -> pd.DataFrame:
-    import urllib.error
+    import urllib.error, pandas as pd
     from urllib.parse import quote
     try:
         aba_enc = quote(aba_nome, safe="")
@@ -150,13 +169,7 @@ def _read_csv_by_name(sheet_id: str, aba_nome: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner=True)
 def ler_aba(sheet_id: str, aba_nome: str, gid: str = "") -> pd.DataFrame:
-    """
-    Ordem:
-      1) Service Account (robusto, não exige público)
-      2) CSV por GID (se público)
-      3) CSV por NOME (se público)
-    """
-    # 1) SA primeiro
+    # 1) Service Account
     if sheet_id and _has_sa():
         try:
             df = _read_ws_values(sheet_id, aba_nome)
@@ -166,14 +179,14 @@ def ler_aba(sheet_id: str, aba_nome: str, gid: str = "") -> pd.DataFrame:
         except Exception as e:
             st.info(f"[SA] tentativa em '{aba_nome}' falhou: {e}")
 
-    # 2) CSV por GID (só se público)
+    # 2) CSV por GID
     if sheet_id and gid:
         df = _read_csv_by_gid(sheet_id, gid)
         if not df.empty:
             st.session_state.setdefault("_como_leu", {})[aba_nome] = "csv_gid"
             return df
 
-    # 3) CSV por NOME (só se público)
+    # 3) CSV por NOME
     if sheet_id and aba_nome:
         df = _read_csv_by_name(sheet_id, aba_nome)
         if not df.empty:
@@ -183,9 +196,9 @@ def ler_aba(sheet_id: str, aba_nome: str, gid: str = "") -> pd.DataFrame:
     st.session_state.setdefault("_como_leu", {})[aba_nome] = "falhou"
     return pd.DataFrame()
 
-# ======================================================
-# Diagnóstico de conexão (mostra SA e abas)
-# ======================================================
+# =============================================================================
+# Diagnóstico
+# =============================================================================
 with st.expander("🧪 Diagnóstico de Conexão", expanded=False):
     st.write("**SHEET_ID:**", SHEET_ID or "(vazio)")
     if _has_sa():
@@ -207,9 +220,9 @@ with st.expander("🧪 Diagnóstico de Conexão", expanded=False):
     else:
         st.warning("Service Account ausente nos secrets (GCP_SERVICE_ACCOUNT / gcp_service_account).")
 
-# ======================================================
-# Carregamento das abas
-# ======================================================
+# =============================================================================
+# Carregar dados
+# =============================================================================
 if not SHEET_ID:
     st.error("❌ `SHEET_ID` não definido nos secrets.")
     st.stop()
@@ -219,40 +232,36 @@ with st.spinner("Carregando dados da planilha..."):
     df_tx_raw     = ler_aba(SHEET_ID, ABA_LANCAMENTOS, ABA_LANCAMENTOS_GID)
     df_pv_raw     = ler_aba(SHEET_ID, ABA_PROVENTOS, ABA_PROVENTOS_GID)
 
-# ======================================================
-# Padronizações
-# ======================================================
+# =============================================================================
+# Padronizações (mapeando os nomes que você tem na planilha)
+# =============================================================================
 def padronizar_ativos(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     cols = {c.lower().strip(): c for c in df.columns}
     def pick(*opts):
         for o in opts:
-            on = (o.lower().strip()
-                    .replace("ç","c").replace("ã","a").replace("õ","o")
-                    .replace("é","e").replace("ê","e"))
-            for k,v in cols.items():
-                kn = (k.replace("ç","c").replace("ã","a").replace("õ","o")
-                        .replace("é","e").replace("ê","e"))
-                if kn == on:
+            ol = o.lower().strip()
+            for k, v in cols.items():
+                if k == ol:
                     return v
         return None
     mapa = {
         "Ticker": pick("ticker"),
-        "%NaCarteira": pick("% na carteira","percentual na carteira"),
-        "Quantidade": pick("quantidade (liquida)","quantidade","qtd"),
-        "PrecoMedioCompra": pick("preco medio (compra r$)","preco medio compra r$","preco medio"),
-        "PrecoMedioAjustado": pick("preco medio ajustado (r$)","preco medio ajustado"),
-        "CotacaoHojeBRL": pick("cotacao de hoje (r$)","cotacao hoje r$","cotacao r$"),
-        "CotacaoHojeUSD": pick("cotacao de hoje (us$)","cotacao hoje us$"),
+        "%NaCarteira": pick("% na carteira"),
+        "Quantidade": pick("quantidade (liquida)", "quantidade", "qtd"),
+        "PrecoMedioCompra": pick("preco medio (compra r$)", "preço (compra r$)", "preco medio compra r$"),
+        "PrecoMedioAjustado": pick("preco medio ajustado (r$)"),
+        "CotacaoHojeBRL": pick("cotacao de hoje (r$)"),
+        "CotacaoHojeUSD": pick("cotacao de hoje (us$)"),
         "ValorInvestido": pick("valor investido"),
         "ValorAtual": pick("valor atual"),
-        "ProventosMes": pick("proventos (do mes)","proventos do mes"),
-        "ProventosAnterior": pick("proventos (anterior)","proventos anterior"),
-        "ProventosProjetado": pick("proventos (projetado)","proventos projetado"),
-        "Classe": pick("classe","classe do ativo","tipo"),
+        "ProventosMes": pick("proventos (do mes)"),
+        "ProventosAnterior": pick("proventos (anterior)"),
+        "ProventosProjetado": pick("proventos (projetado)"),
+        "Classe": pick("classe", "classe do ativo", "tipo"),
     }
-    out = pd.DataFrame({k: (df[v] if v in df.columns else None) for k,v in mapa.items()})
+    out = pd.DataFrame({k: (df[v] if v in df.columns else None) for k, v in mapa.items()})
     for col in ["%NaCarteira","Quantidade","PrecoMedioCompra","PrecoMedioAjustado",
                 "CotacaoHojeBRL","CotacaoHojeUSD","ValorInvestido","ValorAtual",
                 "ProventosMes","ProventosAnterior","ProventosProjetado"]:
@@ -266,10 +275,10 @@ def padronizar_lancamentos(df: pd.DataFrame) -> pd.DataFrame:
     poss = {
         "Classe": ["Classe","Classe do Ativo","Tipo de Ativo"],
         "Ticker": ["Ticker"],
-        "Data": ["Data","Data (DD/MM/YYYY)","Data da Operação"],
-        "Tipo": ["Tipo","Tipo de Operação","Operação"],
+        "Data": ["Data", "Data (DD/MM/YYYY)"],
+        "Tipo": ["Tipo", "Tipo de Operação", "Tipo de Operacao", "Operação"],
         "Quantidade": ["Quantidade","Qtd"],
-        "Preco": ["Preço (por unidade)","Preço","Preco"],
+        "Preco": ["Preço (por unidade)", "Preco (por unidade)", "Preço Unitário", "Preco Unitario"],
         "Taxas": ["Taxa","Taxas"],
         "IRRF": ["IRRF"],
         "TotalOperacao": ["Total da Operação","Total da Operacao","Valor Bruto"],
@@ -295,16 +304,32 @@ def padronizar_proventos(df: pd.DataFrame) -> pd.DataFrame:
     poss = {
         "Data": ["Data"],
         "Ticker": ["Ticker"],
-        "Tipo": ["Tipo","Tipo de Provento"],
-        "Valor": ["Valor","Valor (R$)","Provento R$","Total Líquido","Total Liquido R$","Total"],
-        "Classe": ["Classe","Classe do Ativo"],
+        "Tipo": ["Tipo", "Tipo Provento"],
+        "ValorUnitario": ["Unitário R$", "Unitario R$", "Unitário", "Unitario"],
+        "Valor": ["Total Líquido R$", "Total Liquido R$", "Valor", "Total"],
+        "Classe": ["Classe do Ativo", "Classe"],
+        "Quantidade": ["Quantidade", "Qtd"],
+        "PTAX": ["PTAX"],
+        "ValorBruto": ["Total Bruto R$", "Total Bruto"],
+        "IRRF": ["IRRF"],
+        "Mes": ["Mês","Mes"],
+        "Ano": ["Ano"],
     }
     out = pd.DataFrame()
     for novo, cands in poss.items():
         col = next((c for c in cands if c in df.columns), None)
         out[novo] = df[col] if col else None
+
     out["Data"] = to_datetime_br(out["Data"])
-    out["Valor"] = out["Valor"].map(br_to_float)
+    for col in ["Quantidade","ValorUnitario","Valor","ValorBruto","IRRF"]:
+        if col in out.columns:
+            out[col] = out[col].map(br_to_float)
+
+    if "Valor" not in out.columns or out["Valor"].isna().all():
+        # calcula total se veio só unitário * quantidade
+        if {"Quantidade","ValorUnitario"}.issubset(out.columns):
+            out["Valor"] = out["Quantidade"].fillna(0).astype(float) * out["ValorUnitario"].fillna(0).astype(float)
+
     if "Tipo" in out.columns:
         out["Tipo"] = out["Tipo"].astype(str).str.upper().str.strip()
     return out
@@ -313,9 +338,9 @@ DF_ATIVOS = padronizar_ativos(df_ativos_raw)
 TX        = padronizar_lancamentos(df_tx_raw)
 PV        = padronizar_proventos(df_pv_raw)
 
-# ======================================================
-# Filtros (seguros)
-# ======================================================
+# =============================================================================
+# Filtros
+# =============================================================================
 with st.sidebar:
     st.header("Filtros")
 
@@ -376,9 +401,9 @@ if ticker_sel:
     if not PV.empty and "Ticker" in PV.columns:
         PV = PV[PV["Ticker"].isin(ticker_sel)]
 
-# ======================================================
-# Carteira (Meus Ativos)
-# ======================================================
+# =============================================================================
+# Carteira
+# =============================================================================
 st.subheader("📦 Carteira Atual (aba 'Meus Ativos')")
 if DF_ATIVOS.empty:
     st.info("Sem dados na aba de ativos (confira permissão/GID/nomes).")
@@ -408,9 +433,9 @@ else:
             fig.update_layout(yaxis_title="R$")
             st.plotly_chart(fig, use_container_width=True)
 
-# ======================================================
+# =============================================================================
 # Aportes x Retiradas
-# ======================================================
+# =============================================================================
 st.subheader("💸 Aportes x Retiradas (mensal)")
 if TX.empty:
     st.caption("Sem dados em '2. Lançamentos (B3)'.")
@@ -436,9 +461,9 @@ else:
     with st.expander("Ver lançamentos filtrados"):
         st.dataframe(TX.sort_values("Data"), use_container_width=True)
 
-# ======================================================
+# =============================================================================
 # Proventos
-# ======================================================
+# =============================================================================
 st.subheader("💰 Proventos (mensal)")
 if PV.empty:
     st.caption("Sem dados em '3. Proventos'.")
@@ -461,16 +486,16 @@ else:
     with st.expander("Ver proventos filtrados"):
         st.dataframe(PV.sort_values("Data"), use_container_width=True)
 
-# ======================================================
-# Dicas e modo de leitura
-# ======================================================
+# =============================================================================
+# Dicas
+# =============================================================================
 with st.expander("⚙️ Ajustes e dicas"):
     st.markdown(
         """
-- **Compartilhe a planilha** com a *Service Account* (Reader/Editor).
+- **Planilha** compartilhada com a *Service Account* ✅
 - Leitura prioriza **Service Account**; CSV (GID/NOME) só se a planilha for pública.
-- Datas: `dayfirst=True`; números BR normalizados (R$, milhar, vírgula).
-- Informe **GIDs** nos *secrets* apenas se quiser forçar CSV.
+- Cabeçalho é detectado por **palavras‑chave** (resolve o `3. Proventos`).
+- Datas: `dayfirst=True`; valores BR normalizados (R$, milhar, vírgula).
         """
     )
     if "_como_leu" in st.session_state:
