@@ -1,9 +1,9 @@
 # 101_Resumo_Investimentos.py
-# Proventos & Calendário — robusto (Service Account -> CSV por nome -> CSV por GID)
-# - Lê abas "3. Proventos" e "1. Meus Ativos" da sua planilha
-# - Mapeia nomes de colunas flexíveis
-# - Corrige IntCastingNaNError (filtro de Ano usa coluna segura 'Ano_num')
-# - KPIs, Pivot Jan–Dez, DY/YOC/Yield do mês e exportação
+# Proventos & Calendário — conectado às abas APP_Proventos e APP_MeusAtivos
+# - Acesso robusto: Service Account (secrets) -> CSV por nome -> CSV por GID
+# - Realinha cabeçalho quando há linhas decorativas antes da tabela
+# - Evita IntCastingNaNError (usa coluna segura 'Ano_num')
+# - KPIs, pivot Jan–Dez, DY/YOC/Yield do mês e exportações
 
 import streamlit as st
 import pandas as pd
@@ -19,16 +19,16 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="Proventos & Calendário", page_icon="💸", layout="wide")
 st.title("💸 Proventos & Calendário")
 
-# ID da sua planilha de investimentos
-SHEET_ID = "1p9IzDr-5ZV0phUHfNA_9d5xNvZW1IRo84LA__JyiiQc"
+# <<< SUBSTITUÍDO PELO SEU NOVO ID >>>
+SHEET_ID = "1TQBzbueeBTgNmXwZPg04GFOwNL4vh_1ZbKlDAGQJ09o"
 
-# Nomes/aliases aceitos das abas (o código tentará nesta ordem)
-PROVENTOS_ALVOS   = ["3. Proventos", "Proventos", "3 Proventos", "3-Proventos"]
-MEUS_ATIVOS_ALVOS = ["1. Meus Ativos", "Meus Ativos", "1 Meus Ativos", "1-Meus Ativos"]
+# Abas de leitura (nomes exatos das abas "limpas" criadas por você)
+PROVENTOS_ALVOS   = ["APP_Proventos"]
+MEUS_ATIVOS_ALVOS = ["APP_MeusAtivos"]
 
-# (opcional) use GID se preferir/precisar
-GID_PROVENTOS   = None  # ex.: "1706363649"
-GID_MEUS_ATIVOS = None  # ex.: "441194831"
+# (opcional) use GID para ficar à prova de renome
+GID_PROVENTOS   = "2109089485"  # gid da APP_Proventos (da sua URL)
+GID_MEUS_ATIVOS = None          # preencha quando quiser usar por GID também
 
 MESES_PT = {
     1: "janeiro", 2: "fevereiro", 3: "março", 4: "abril",
@@ -55,7 +55,6 @@ def to_float_br(x):
            .replace("$", "")
            .replace("€", "")
            .replace(" ", ""))
-    # 1.234,56 -> 1234.56 ; 1.234 -> 1234 ; 1234,56 -> 1234.56
     s = s.replace(".", "").replace(",", ".")
     try:
         return float(s)
@@ -90,7 +89,6 @@ def pick_col(df: pd.DataFrame, candidates):
         k = cand.lower().strip()
         if k in cols:
             return cols[k]
-    # startswith flexível
     for cand in candidates:
         for k, orig in cols.items():
             if k.startswith(cand.lower().strip()):
@@ -103,14 +101,24 @@ def fmt_moeda(v):
     except Exception:
         return v
 
+def realinha_cabecalho(df, procurar=("ticker", "data")):
+    """Se o cabeçalho não estiver na primeira linha, encontra e realinha."""
+    for i in range(min(20, len(df))):
+        linha = df.iloc[i].astype(str).str.strip().str.lower().tolist()
+        if any(procurar[0] in x for x in linha) and any(procurar[1] in x for x in linha):
+            cols = df.iloc[i].tolist()
+            df2 = df.iloc[i+1:].copy()
+            df2.columns = cols
+            df2 = df2.dropna(how="all").dropna(axis=1, how="all")
+            return df2
+    return df
+
 # =========================
 # CARREGAMENTO ROBUSTO
 # =========================
 @st.cache_data(ttl=300)
 def carregar_via_service_account(sheet_id: str, alvo_nomes: list):
-    """
-    Tenta ler via Service Account (secrets). Se não houver secret ou acesso, retorna None.
-    """
+    """Tenta ler via Service Account (secrets). Se não houver acesso, retorna None."""
     try:
         import gspread
         from gspread_dataframe import get_as_dataframe
@@ -118,7 +126,7 @@ def carregar_via_service_account(sheet_id: str, alvo_nomes: list):
 
         info = st.secrets.get("gcp_service_account") or st.secrets.get("GCP_SERVICE_ACCOUNT")
         if not info:
-            return None  # sem secret -> CSV
+            return None
         creds = Credentials.from_service_account_info(
             info,
             scopes=[
@@ -129,8 +137,7 @@ def carregar_via_service_account(sheet_id: str, alvo_nomes: list):
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(sheet_id)
 
-        # normaliza títulos para bater com aliases
-        def norm(s):  # remove pontuação extra e normaliza espaços
+        def norm(s):
             return re.sub(r"\s+", " ", re.sub(r"[^\w]+", " ", s.lower())).strip()
 
         mapa = {norm(ws.title): ws for ws in sh.worksheets()}
@@ -146,9 +153,7 @@ def carregar_via_service_account(sheet_id: str, alvo_nomes: list):
 
 @st.cache_data(ttl=300)
 def carregar_via_csv(sheet_id: str, alvo_nomes: list, gid: str | None):
-    """
-    Tenta CSV por nome (URL-encode). Se falhar, tenta por GID (se informado).
-    """
+    """Tenta CSV por nome; se falhar e houver GID, tenta por GID."""
     last_err = None
     for nome in alvo_nomes:
         try:
@@ -167,15 +172,14 @@ def carregar_tabela(sheet_id: str, alvo_nomes: list, gid: str | None):
     df = carregar_via_service_account(sheet_id, alvo_nomes)
     if df is not None:
         return df
-    # sem secret/sem acesso => tenta CSV público
     try:
         return carregar_via_csv(sheet_id, alvo_nomes, gid)
     except Exception as e:
         st.error(
             "Não consegui ler a aba por CSV. Opções:\n"
             "1) Deixe a planilha como 'Qualquer pessoa com o link – Leitor';\n"
-            "2) OU compartilhe com o e-mail da Service Account (secrets `client_email`);\n"
-            "3) OU preencha o GID da aba nas constantes GID_*.\n\n"
+            "2) Compartilhe com o e-mail da Service Account (secrets `client_email`);\n"
+            "3) Preencha o GID da aba nas constantes GID_*.\n\n"
             f"Erro: {type(e).__name__}: {e}"
         )
         raise
@@ -186,8 +190,8 @@ def carregar_tabela(sheet_id: str, alvo_nomes: list, gid: str | None):
 @st.cache_data(ttl=300)
 def load_proventos(sheet_id: str) -> pd.DataFrame:
     df = carregar_tabela(sheet_id, PROVENTOS_ALVOS, GID_PROVENTOS)
+    df = realinha_cabecalho(df)
 
-    # Mapeia nomes de colunas (flexível)
     col_ticker    = pick_col(df, ["Ticker"])
     col_tipo      = pick_col(df, ["Tipo Provento", "Tipo", "Provento"])
     col_data      = pick_col(df, ["Data"])
@@ -217,7 +221,6 @@ def load_proventos(sheet_id: str) -> pd.DataFrame:
 
     df = df.rename(columns=rename)
 
-    # Garante todas as colunas (evita KeyError)
     required = [
         "Ticker", "Tipo", "Data", "Quantidade", "Unitario_R$",
         "Total_Liquido_R$", "IRRF", "PTAX", "Total_Bruto_R$",
@@ -227,28 +230,23 @@ def load_proventos(sheet_id: str) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = np.nan
 
-    # Limpeza/conversões
     df["Data"] = df["Data"].map(to_date_br)
     df["Quantidade"] = df["Quantidade"].map(to_int_safe)
     for c in ["Unitario_R$", "Total_Liquido_R$", "Total_Bruto_R$", "IRRF", "PTAX"]:
         df[c] = df[c].map(to_float_br)
 
-    # Completa Ano/Mês quando faltarem
     if df["Data"].notna().any():
         df.loc[df["Ano"].isna(), "Ano"] = [d.year if pd.notna(d) else np.nan for d in df["Data"]]
         df.loc[df["Mes"].isna(), "Mes"] = [MESES_PT.get(d.month) if pd.notna(d) else np.nan for d in df["Data"]]
 
-    # Calcula Total_Liquido_R$ quando der (Qtd*Unit - IRRF)
     have_qtd = df["Quantidade"].notna()
     have_uni = df["Unitario_R$"].notna()
     need_calc = df["Total_Liquido_R$"].isna() & have_qtd & have_uni
     df.loc[need_calc, "Total_Liquido_R$"] = df.loc[need_calc, "Quantidade"] * df.loc[need_calc, "Unitario_R$"]
     df.loc[need_calc & df["IRRF"].notna(), "Total_Liquido_R$"] -= df.loc[need_calc & df["IRRF"].notna(), "IRRF"]
 
-    # Normalizações finais
     df = df[df["Ticker"].astype(str).str.strip() != ""].copy()
     df["Classe"] = df["Classe"].fillna("")
-
     return df
 
 # =========================
@@ -257,6 +255,7 @@ def load_proventos(sheet_id: str) -> pd.DataFrame:
 @st.cache_data(ttl=300)
 def load_meus_ativos(sheet_id: str) -> pd.DataFrame:
     df = carregar_tabela(sheet_id, MEUS_ATIVOS_ALVOS, GID_MEUS_ATIVOS)
+    df = realinha_cabecalho(df)
 
     col_ticker   = pick_col(df, ["Ticker"])
     col_pct      = pick_col(df, ["% na Carteira", "% na carteira"])
@@ -295,12 +294,12 @@ def load_meus_ativos(sheet_id: str) -> pd.DataFrame:
 prov = load_proventos(SHEET_ID)
 ativos = load_meus_ativos(SHEET_ID)
 
-# ---- DEBUG opcional (colunas detectadas)
+# Debug opcional
 if st.sidebar.checkbox("🔧 Mostrar colunas detectadas (debug)"):
     st.write("Proventos:", sorted(prov.columns.tolist()))
     st.write("Meus Ativos:", sorted(ativos.columns.tolist()))
 
-# Coluna segura para filtro de ano (evita IntCastingNaNError)
+# Coluna segura para filtro de ano
 prov["Ano_num"] = pd.to_numeric(prov.get("Ano"), errors="coerce")
 if prov["Ano_num"].isna().all() and "Data" in prov.columns:
     prov["Ano_num"] = prov["Data"].apply(lambda d: d.year if pd.notna(d) else np.nan)
@@ -313,7 +312,7 @@ if not anos_disponiveis:
 # =========================
 # FILTROS
 # =========================
-ano_sel = st.sidebar.selectbox("Ano", anos_disponiveis[::-1])  # já é int
+ano_sel = st.sidebar.selectbox("Ano", anos_disponiveis[::-1])
 classes = ["(todas)"] + sorted([c for c in prov["Classe"].dropna().unique() if str(c).strip() != ""])
 classe_sel = st.sidebar.selectbox("Classe", classes, index=0)
 posicoes = ["(todas)", "Ativa", "Encerrada"]
@@ -367,7 +366,6 @@ agg_12m = (
     .rename(columns={"Total_Liquido_R$": "Prov_12m_R$"})
 )
 
-# Último "Unitário R$" do ano filtrado — proxy para Yield do mês
 ult_unit = (
     df.sort_values("Data")
       .dropna(subset=["Unitario_R$"])
@@ -444,4 +442,4 @@ with col_b2:
         mime="text/csv",
     )
 
-st.caption("Fonte: abas **3. Proventos** e **1. Meus Ativos**. O app respeita os valores que você lançou (não recalcula impostos).")
+st.caption("Fonte: **APP_Proventos** e **APP_MeusAtivos**. O app usa exatamente o que você lançou (não recalcula impostos).")
