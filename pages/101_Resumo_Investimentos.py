@@ -3,8 +3,9 @@
 # - Acesso robusto: Service Account (secrets) -> CSV por nome -> CSV por GID
 # - Realinha cabeçalho quando há linhas antes da tabela
 # - Evita IntCastingNaNError (usa 'Ano_num')
-# - Preenche Posicao/Pct_Carteira se faltarem em APP_MeusAtivos
-# - KPIs, Pivot Jan–Dez, DY/YOC/Yield do mês e exportações
+# - Recalcula Total_Liquido_R$ (Qtd * Unitário - IRRF)
+# - Recalcula Pct_Carteira de forma robusta
+# - KPIs, Pivot Jan–Dez, DY/YOC/Yield do mês, exportações e diagnóstico
 
 import streamlit as st
 import pandas as pd
@@ -20,16 +21,16 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="Proventos & Calendário", page_icon="💸", layout="wide")
 st.title("💸 Proventos & Calendário")
 
-# --- Seu novo ID de planilha ---
+# Seu ID da planilha "cópia"
 SHEET_ID = "1TQBzbueeBTgNmXwZPg04GFOwNL4vh_1ZbKlDAGQJ09o"
 
-# Abas-alvo (nomes)
+# Abas-alvo (nomes "limpos")
 PROVENTOS_ALVOS   = ["APP_Proventos"]
 MEUS_ATIVOS_ALVOS = ["APP_MeusAtivos"]
 
 # (opcional) GIDs — úteis se renomear as abas
-GID_PROVENTOS   = "2109089485"  # da URL que você enviou
-GID_MEUS_ATIVOS = None          # preencha quando quiser usar GID também
+GID_PROVENTOS   = "2109089485"  # APP_Proventos
+GID_MEUS_ATIVOS = None          # preencha se quiser
 
 MESES_PT = {
     1: "janeiro", 2: "fevereiro", 3: "março", 4: "abril",
@@ -199,32 +200,25 @@ def load_proventos(sheet_id: str) -> pd.DataFrame:
     col_data      = pick_col(df, ["Data"])
     col_qtd       = pick_col(df, ["Quantidade", "Qtd"])
     col_unit      = pick_col(df, ["Unitário R$", "Unitario R$", "Unitário", "Unitario", "Valor por cota", "Valor unitário"])
-    col_tot_liq   = pick_col(df, ["Total Líquido R$", "Total Liquido R$", "Total Líquido", "Total Liquido"])
     col_irrf      = pick_col(df, ["IRRF", "Imposto", "Impostos"])
-    col_ptax      = pick_col(df, ["PTAX", "Ptax"])
-    col_tot_bruto = pick_col(df, ["Total Bruto R$", "Total Bruto"])
     col_mes       = pick_col(df, ["Mês", "Mes"])
     col_ano       = pick_col(df, ["Ano"])
     col_classe    = pick_col(df, ["Classe do Ativo", "Classe", "Classe do ativo"])
 
     rename = {}
-    if col_ticker:    rename[col_ticker]    = "Ticker"
-    if col_tipo:      rename[col_tipo]      = "Tipo"
-    if col_data:      rename[col_data]      = "Data"
-    if col_qtd:       rename[col_qtd]       = "Quantidade"
-    if col_unit:      rename[col_unit]      = "Unitario_R$"
-    if col_tot_liq:   rename[col_tot_liq]   = "Total_Liquido_R$"
-    if col_irrf:      rename[col_irrf]      = "IRRF"
-    if col_ptax:      rename[col_ptax]      = "PTAX"
-    if col_tot_bruto: rename[col_tot_bruto] = "Total_Bruto_R$"
-    if col_mes:       rename[col_mes]       = "Mes"
-    if col_ano:       rename[col_ano]       = "Ano"
-    if col_classe:    rename[col_classe]    = "Classe"
+    if col_ticker: rename[col_ticker] = "Ticker"
+    if col_tipo:   rename[col_tipo]   = "Tipo"
+    if col_data:   rename[col_data]   = "Data"
+    if col_qtd:    rename[col_qtd]    = "Quantidade"
+    if col_unit:   rename[col_unit]   = "Unitario_R$"
+    if col_irrf:   rename[col_irrf]   = "IRRF"
+    if col_mes:    rename[col_mes]    = "Mes"
+    if col_ano:    rename[col_ano]    = "Ano"
+    if col_classe: rename[col_classe] = "Classe"
     df = df.rename(columns=rename)
 
     # garantir colunas
-    required = ["Ticker","Tipo","Data","Quantidade","Unitario_R$","Total_Liquido_R$",
-                "IRRF","PTAX","Total_Bruto_R$","Mes","Ano","Classe"]
+    required = ["Ticker","Tipo","Data","Quantidade","Unitario_R$","IRRF","Mes","Ano","Classe"]
     for c in required:
         if c not in df.columns:
             df[c] = np.nan
@@ -232,7 +226,7 @@ def load_proventos(sheet_id: str) -> pd.DataFrame:
     # limpeza
     df["Data"] = df["Data"].map(to_date_br)
     df["Quantidade"] = df["Quantidade"].map(to_int_safe)
-    for c in ["Unitario_R$","Total_Liquido_R$","Total_Bruto_R$","IRRF","PTAX"]:
+    for c in ["Unitario_R$", "IRRF"]:
         df[c] = df[c].map(to_float_br)
 
     # completar Ano/Mês com Series alinhadas
@@ -242,12 +236,12 @@ def load_proventos(sheet_id: str) -> pd.DataFrame:
         df["Ano"] = pd.to_numeric(df["Ano"], errors="coerce").fillna(ano_series)
         df["Mes"] = df["Mes"].fillna(mes_series)
 
-    # calcular Total_Liquido_R$ quando possível
-    have_qtd = df["Quantidade"].notna()
-    have_uni = df["Unitario_R$"].notna()
-    need_calc = df["Total_Liquido_R$"].isna() & have_qtd & have_uni
-    df.loc[need_calc, "Total_Liquido_R$"] = df.loc[need_calc, "Quantidade"] * df.loc[need_calc, "Unitario_R$"]
-    df.loc[need_calc & df["IRRF"].notna(), "Total_Liquido_R$"] -= df.loc[need_calc & df["IRRF"].notna(), "IRRF"]
+    # === CÁLCULO CORRETO DO TOTAL ===
+    df["Quantidade"]  = df["Quantidade"].fillna(0)
+    df["Unitario_R$"] = df["Unitario_R$"].fillna(0)
+    df["IRRF"]        = df["IRRF"].fillna(0)
+    df["Total_Liquido_R$"] = df["Quantidade"] * df["Unitario_R$"] - df["IRRF"]
+    df["Total_Liquido_R$"] = df["Total_Liquido_R$"].clip(lower=0)
 
     # finais
     df = df[df["Ticker"].astype(str).str.strip() != ""].copy()
@@ -292,34 +286,24 @@ def load_meus_ativos(sheet_id: str) -> pd.DataFrame:
     if "Cotacao_R$" in df.columns:
         df["Cotacao_R$"] = df["Cotacao_R$"].map(to_float_br)
 
-    # ----- Deriva POSIÇÃO se faltar -----
+    # ===== Posição e % na carteira robustas =====
+    qtd = df.get("Qtd_Liquida", pd.Series(0)).fillna(0)
+    cot = df.get("Cotacao_R$",   pd.Series(0)).fillna(0)
+    pm  = df.get("PM_Ajustado_R$", pd.Series(0)).fillna(0)
+
+    # posição (se faltar)
     if "Posicao" not in df.columns or df["Posicao"].isna().all():
-        qtd = df.get("Qtd_Liquida", pd.Series(0)).fillna(0)
         df["Posicao"] = np.where(qtd > 0, "Ativa", "Encerrada")
 
-    # ----- Calcula % na Carteira se faltar -----
-    def _pct_from(values: pd.Series):
-        if values is None:
-            return None
-        values = values.fillna(0)
-        total = values.sum()
-        if total > 0:
-            return values / total
-        return None
+    # base para %: usa valor atual; se zerado, usa investido
+    valor_atual     = (cot * qtd)
+    valor_investido = (pm  * qtd)
+    base = valor_atual.where(valor_atual > 0, valor_investido)
+    total_base = base.sum()
+    df["Pct_Carteira"] = np.where(total_base > 0, base / total_base, 0.0)
 
-    need_pct = ("Pct_Carteira" not in df.columns) or df["Pct_Carteira"].isna().all()
-    if need_pct:
-        qtd = df.get("Qtd_Liquida", pd.Series(np.nan))
-        cot = df.get("Cotacao_R$",   pd.Series(np.nan))
-        pm  = df.get("PM_Ajustado_R$", pd.Series(np.nan))
-
-        valor_atual = (cot * qtd) if (cot is not None and qtd is not None) else None
-        pct = _pct_from(valor_atual)
-        if pct is None:
-            valor_investido = (pm * qtd) if (pm is not None and qtd is not None) else None
-            pct = _pct_from(valor_investido)
-
-        df["Pct_Carteira"] = pct if pct is not None else np.nan
+    if "Classe" not in df.columns:
+        df["Classe"] = ""
 
     return df
 
@@ -334,7 +318,7 @@ if st.sidebar.checkbox("🔧 Mostrar colunas detectadas (debug)"):
     st.write("Proventos:", sorted(prov.columns.tolist()))
     st.write("Meus Ativos:", sorted(ativos.columns.tolist()))
 
-# Coluna segura de ano (deriva de Data se necessário)
+# Coluna segura de ano
 prov["Ano_num"] = pd.to_numeric(prov.get("Ano"), errors="coerce")
 if prov["Ano_num"].isna().all() and "Data" in prov.columns:
     prov["Ano_num"] = prov["Data"].apply(lambda d: d.year if pd.notna(d) else np.nan)
@@ -368,6 +352,15 @@ if df.empty:
     st.warning("Sem registros para os filtros escolhidos.")
     st.stop()
 
+# 🔎 Diagnóstico rápido (top 10 por valor)
+with st.expander("🔎 Diagnóstico (top 10 por valor do mês/ano)"):
+    st.dataframe(
+        df.sort_values("Total_Liquido_R$", ascending=False)[
+            ["Ticker","Data","Quantidade","Unitario_R$","IRRF","Total_Liquido_R$"]
+        ].head(10),
+        use_container_width=True
+    )
+
 # =========================
 # CALENDÁRIO (pivot Jan–Dez)
 # =========================
@@ -383,14 +376,14 @@ media_mensal = total_ano / 12.0
 melhor_mes_idx = pivot.drop(columns=["Total no ano"]).sum().idxmax()
 melhor_mes_val = pivot.drop(columns=["Total no ano"]).sum().max()
 
-# Metadados tolerantes (sem KeyError)
+# Metadados (sem KeyError)
 meta_cols = ["Ticker", "Classe", "Pct_Carteira", "Posicao"]
 if "Classe" not in ativos.columns:
     ativos["Classe"] = ""
 if "Posicao" not in ativos.columns:
     ativos["Posicao"] = np.where(ativos.get("Qtd_Liquida", pd.Series(0)).fillna(0) > 0, "Ativa", "Encerrada")
 if "Pct_Carteira" not in ativos.columns:
-    ativos["Pct_Carteira"] = np.nan
+    ativos["Pct_Carteira"] = 0.0
 
 meta = ativos[meta_cols].copy()
 meta["Pct_Carteira"] = meta["Pct_Carteira"].fillna(0.0)
@@ -486,4 +479,4 @@ with col_b2:
         mime="text/csv",
     )
 
-st.caption("Fonte: **APP_Proventos** e **APP_MeusAtivos**. O app usa exatamente o que você lançou (não recalcula impostos).")
+st.caption("Fonte: **APP_Proventos** e **APP_MeusAtivos**. Total calculado por Qtd × Unitário − IRRF; % na carteira recalculada pelo app.")
