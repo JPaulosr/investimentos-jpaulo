@@ -1,284 +1,348 @@
-# pages/1_Resumo_Investimentos.py
-# Resumo de Investimentos — lendo direto de Excel (.xlsx)
+# 3_Proventos_e_Calendario.py
+# MVP Proventos + Calendário — conectado às abas "3. Proventos" e "1. Meus Ativos"
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
-from datetime import date, timedelta
+from io import BytesIO
+from urllib.parse import quote
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="💼 Resumo de Investimentos", page_icon="💼", layout="wide")
-TEMPLATE = "plotly_dark"
-st.title("💼 Resumo de Investimentos")
+st.set_page_config(page_title="Proventos & Calendário", page_icon="💸", layout="wide")
+st.title("💸 Proventos & Calendário")
 
 # =========================
-# Helpers
+# CONFIG — edite aqui se precisar
 # =========================
-def moeda(v) -> str:
-    try: v = float(v)
-    except Exception: v = 0.0
-    return f"R$ {v:,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
+SHEET_ID = "1p9IzDr-5ZV0phUHfNA_9d5xNvZW1IRo84LA__JyiiQc"  # sua planilha de investimentos
+ABA_PROVENTOS = "3. Proventos"
+ABA_MEUS_ATIVOS = "1. Meus Ativos"
 
-def to_float_br(s):
-    if pd.isna(s): return np.nan
-    s = str(s).strip()
-    s = s.replace("R$", "").replace(" ", "")
+PLOTLY_TEMPLATE = "plotly_dark"
+
+# =========================
+# HELPERS
+# =========================
+MESES_PT = {
+    1: "janeiro", 2: "fevereiro", 3: "março", 4: "abril",
+    5: "maio", 6: "junho", 7: "julho", 8: "agosto",
+    9: "setembro", 10: "outubro", 11: "novembro", 12: "dezembro"
+}
+COL_ORDEM_MESES = list(MESES_PT.values())
+
+def csv_url(sheet_id: str, sheet_name: str) -> str:
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&sheet={quote(sheet_name)}"
+
+def to_float_br(x):
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip()
+    if s == "" or s.lower() in {"nan", "none", "-"}:
+        return np.nan
+    # remove símbolo de moeda e espaços
+    s = s.replace("R$", "").replace("$", "").replace("US$", "").replace("€", "").strip()
+    # pt-BR: separador milhar "." e decimal ","
+    # mas cuide para casos já com ponto decimal
+    # 1.234,56 -> 1234.56 ; 1234,56 -> 1234.56 ; 1234.56 -> 1234.56
     s = s.replace(".", "").replace(",", ".")
-    try: return float(s)
-    except: return np.nan
+    try:
+        return float(s)
+    except Exception:
+        return np.nan
 
-def guess_sheet(xl: pd.ExcelFile, keys):
-    """Acha aba por palavras‑chave (casefold/PT)."""
-    names = xl.sheet_names
-    low = [n.lower() for n in names]
-    for i, n in enumerate(low):
-        if any(k in n for k in keys):
-            return names[i]
+def to_int_safe(x):
+    try:
+        if pd.isna(x) or x == "":
+            return np.nan
+        return int(float(str(x).replace(",", ".").strip()))
+    except Exception:
+        return np.nan
+
+def to_date_br(x):
+    if pd.isna(x) or str(x).strip() == "":
+        return pd.NaT
+    s = str(x).strip()
+    # aceita dd/mm/aaaa ou aaaa-mm-dd
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+    # fallback: tenta pandas
+    try:
+        return pd.to_datetime(s, dayfirst=True).date()
+    except Exception:
+        return pd.NaT
+
+def pick_col(df: pd.DataFrame, candidates):
+    cols = {c.lower().strip(): c for c in df.columns}
+    for cand in candidates:
+        k = cand.lower().strip()
+        if k in cols:
+            return cols[k]
+    # tenta aproximação por começa-com
+    for cand in candidates:
+        for key in cols:
+            if key.startswith(cand.lower().strip()):
+                return cols[key]
     return None
 
-def normalize_cols(df: pd.DataFrame):
-    df = df.copy()
-    df.columns = [c.strip().lower() for c in df.columns]
+# =========================
+# CARREGAMENTO
+# =========================
+@st.cache_data(ttl=300)
+def load_csv(sheet_id: str, sheet_name: str) -> pd.DataFrame:
+    url = csv_url(sheet_id, sheet_name)
+    return pd.read_csv(url, dtype=str)  # lemos tudo como string; limpamos depois
+
+@st.cache_data(ttl=300)
+def load_proventos(sheet_id: str) -> pd.DataFrame:
+    df = load_csv(sheet_id, ABA_PROVENTOS)
+    # mapeia colunas esperadas
+    col_ticker    = pick_col(df, ["Ticker"])
+    col_tipo      = pick_col(df, ["Tipo Provento", "Tipo", "Provento"])
+    col_data      = pick_col(df, ["Data"])
+    col_qtd       = pick_col(df, ["Quantidade"])
+    col_unit      = pick_col(df, ["Unitário R$", "Unitario R$", "Unitário", "Unitario"])
+    col_tot_liq   = pick_col(df, ["Total Líquido R$", "Total Liquido R$", "Total Líquido", "Total Liquido"])
+    col_irrf      = pick_col(df, ["IRRF"])
+    col_ptax      = pick_col(df, ["PTAX"])
+    col_tot_bruto = pick_col(df, ["Total Bruto", "Total Bruto R$"])
+    col_mes       = pick_col(df, ["Mês", "Mes"])
+    col_ano       = pick_col(df, ["Ano"])
+    col_classe    = pick_col(df, ["Classe do Ativo", "Classe"])
+
+    rename = {}
+    if col_ticker:    rename[col_ticker] = "Ticker"
+    if col_tipo:      rename[col_tipo] = "Tipo"
+    if col_data:      rename[col_data] = "Data"
+    if col_qtd:       rename[col_qtd] = "Quantidade"
+    if col_unit:      rename[col_unit] = "Unitario_R$"
+    if col_tot_liq:   rename[col_tot_liq] = "Total_Liquido_R$"
+    if col_irrf:      rename[col_irrf] = "IRRF"
+    if col_ptax:      rename[col_ptax] = "PTAX"
+    if col_tot_bruto: rename[col_tot_bruto] = "Total_Bruto_R$"
+    if col_mes:       rename[col_mes] = "Mes"
+    if col_ano:       rename[col_ano] = "Ano"
+    if col_classe:    rename[col_classe] = "Classe"
+
+    df = df.rename(columns=rename)
+
+    # limpeza
+    if "Data" in df.columns:
+        df["Data"] = df["Data"].map(to_date_br)
+    if "Quantidade" in df.columns:
+        df["Quantidade"] = df["Quantidade"].map(to_int_safe)
+    for c in ["Unitario_R$", "Total_Liquido_R$", "Total_Bruto_R$", "IRRF", "PTAX"]:
+        if c in df.columns:
+            df[c] = df[c].map(to_float_br)
+
+    # mês/ano derivados, se necessário
+    if "Data" in df.columns:
+        df["Ano"] = df.get("Ano", pd.Series(dtype=object))
+        df.loc[df["Ano"].isna(), "Ano"] = pd.Series([d.year if pd.notna(d) else np.nan for d in df["Data"]])
+        df["Mes"] = df.get("Mes", pd.Series(dtype=object))
+        df.loc[df["Mes"].isna(), "Mes"] = pd.Series([MESES_PT.get(d.month) if pd.notna(d) else np.nan for d in df["Data"]])
+
+    # calcula Total Líquido se vier vazio (Qtd*Unitário - IRRF)
+    if "Total_Liquido_R$" not in df.columns:
+        df["Total_Liquido_R$"] = np.nan
+    mask_calc = df["Total_Liquido_R$"].isna() & df["Quantidade"].notna() & df["Unitario_R$"].notna()
+    df.loc[mask_calc, "Total_Liquido_R$"] = df.loc[mask_calc, "Quantidade"] * df.loc[mask_calc, "Unitario_R$"]
+    if "IRRF" in df.columns:
+        df.loc[mask_calc & df["IRRF"].notna(), "Total_Liquido_R$"] -= df.loc[mask_calc & df["IRRF"].notna(), "IRRF"]
+
+    # normaliza classe vazia
+    if "Classe" not in df.columns:
+        df["Classe"] = ""
+
+    # remove linhas totalmente vazias
+    df = df[~df.get("Ticker", "").isna()]
+    df = df[df.get("Ticker", "").astype(str).str.strip() != ""]
+    return df
+
+@st.cache_data(ttl=300)
+def load_meus_ativos(sheet_id: str) -> pd.DataFrame:
+    df = load_csv(sheet_id, ABA_MEUS_ATIVOS)
+
+    col_ticker   = pick_col(df, ["Ticker"])
+    col_pct_cart = pick_col(df, ["% na Carteira", "% na carteira"])
+    col_posicao  = pick_col(df, ["Posição", "Posicao"])
+    col_classe   = pick_col(df, ["Classe"])
+    col_qtd      = pick_col(df, ["Quantidade (Líquida)", "Quantidade", "Qtd"])
+    col_pm_adj   = pick_col(df, ["Preço Médio Ajustado (R$)", "Preço Médio Ajustado", "PM Ajustado"])
+    col_cot_hoje = pick_col(df, ["Cotação de Hoje (R$)", "Cotação de Hoje", "Cotacao de Hoje"])
+
+    rename = {}
+    if col_ticker:   rename[col_ticker] = "Ticker"
+    if col_pct_cart: rename[col_pct_cart] = "Pct_Carteira"
+    if col_posicao:  rename[col_posicao] = "Posicao"
+    if col_classe:   rename[col_classe] = "Classe"
+    if col_qtd:      rename[col_qtd] = "Qtd_Liquida"
+    if col_pm_adj:   rename[col_pm_adj] = "PM_Ajustado_R$"
+    if col_cot_hoje: rename[col_cot_hoje] = "Cotacao_R$"
+
+    df = df.rename(columns=rename)
+
+    # limpeza numérica
+    if "Pct_Carteira" in df.columns:
+        df["Pct_Carteira"] = df["Pct_Carteira"].astype(str).str.replace("%","").map(to_float_br)/100.0
+    if "Qtd_Liquida" in df.columns:
+        df["Qtd_Liquida"] = df["Qtd_Liquida"].map(to_int_safe)
+    if "PM_Ajustado_R$" in df.columns:
+        df["PM_Ajustado_R$"] = df["PM_Ajustado_R$"].map(to_float_br)
+    if "Cotacao_R$" in df.columns:
+        df["Cotacao_R$"] = df["Cotacao_R$"].map(to_float_br)
+
     return df
 
 # =========================
-# Entrada do arquivo
+# DADOS
 # =========================
-st.sidebar.header("Arquivo de dados")
-up = st.sidebar.file_uploader("Carregar planilha Excel (.xlsx)", type=["xlsx"])
-# Também aceito um caminho local (útil no dev/local)
-path_local = st.sidebar.text_input("ou caminho local (opcional)", value="")
+prov = load_proventos(SHEET_ID)
+ativos = load_meus_ativos(SHEET_ID)
 
-if up is not None:
-    excel = up
-elif path_local:
-    try:
-        excel = path_local
-    except Exception:
-        st.error("Caminho inválido.")
-        st.stop()
-else:
-    st.info("Envie o Excel nas opções da esquerda para carregar os dados.")
+anos_disponiveis = sorted(list({int(a) for a in prov["Ano"].dropna().astype(int)}))
+ano_sel = st.sidebar.selectbox("Ano", anos_disponiveis[::-1], index=0)
+
+# Filtros adicionais (classe/posição/ticker)
+classes = ["(todas)"] + sorted([c for c in prov["Classe"].dropna().unique() if str(c).strip() != ""])
+classe_sel = st.sidebar.selectbox("Classe", classes, index=0)
+
+posicoes = ["(todas)", "Ativa", "Encerrada"]
+pos_sel = st.sidebar.selectbox("Posição", posicoes, index=0)
+
+tickers_all = ["(todos)"] + sorted(prov["Ticker"].dropna().unique())
+ticker_sel = st.sidebar.selectbox("Ticker", tickers_all, index=0)
+
+# aplica filtros
+df = prov.copy()
+df = df[df["Ano"].astype(int) == int(ano_sel)]
+if classe_sel != "(todas)":
+    df = df[df["Classe"] == classe_sel]
+if pos_sel != "(todas)":
+    # junta com Meus Ativos para saber posição
+    df = df.merge(ativos[["Ticker","Posicao"]], on="Ticker", how="left")
+    df = df[df["Posicao"].fillna("(desconhecida)") == pos_sel]
+if ticker_sel != "(todos)":
+    df = df[df["Ticker"] == ticker_sel]
+
+# =========================
+# CALENDÁRIO (pivot)
+# =========================
+if df.empty:
+    st.warning("Sem registros para os filtros escolhidos.")
     st.stop()
 
-# =========================
-# Leitura das abas
-# =========================
-try:
-    xl = pd.ExcelFile(excel, engine="openpyxl")
-except Exception as e:
-    st.error(f"Não consegui abrir o Excel. Detalhe: {e}")
-    st.stop()
+df["Mes"] = pd.Categorical(df["Mes"], categories=COL_ORDEM_MESES, ordered=True)
+g_mes_ticker = df.groupby(["Ticker","Mes"], dropna=False)["Total_Liquido_R$"].sum().reset_index()
 
-# Tentativa de descoberta de nomes de abas
-sheet_mov = guess_sheet(xl, ["mov", "lanç", "lanc", "transa", "opera"])
-sheet_pos = guess_sheet(xl, ["posi", "consol", "carteira", "posição", "consolid"])
-sheet_pro = guess_sheet(xl, ["prov", "divid", "rend", "provento"])
+pivot = g_mes_ticker.pivot(index="Ticker", columns="Mes", values="Total_Liquido_R$").fillna(0.0)
+pivot = pivot.reindex(columns=COL_ORDEM_MESES, fill_value=0.0)
 
-colA, colB, colC = st.columns(3)
-with colA: st.caption("Aba Movimentações"); st.code(sheet_mov or "—", language="bash")
-with colB: st.caption("Aba Posição/Consolidado"); st.code(sheet_pos or "—", language="bash")
-with colC: st.caption("Aba Proventos"); st.code(sheet_pro or "—", language="bash")
+# totais do ano e média mensal (12 meses)
+pivot["Total no ano"] = pivot.sum(axis=1)
+total_ano = pivot["Total no ano"].sum()
+media_mensal = total_ano / 12.0
+melhor_mes_idx = pivot.drop(columns=["Total no ano"]).sum().idxmax()
+melhor_mes_val = pivot.drop(columns=["Total no ano"]).sum().max()
 
-if not sheet_mov:
-    st.error("Não encontrei a aba de Movimentações. Renomeie a aba ou escolha um arquivo com essa aba.")
-    st.stop()
-
-# Carrega cada aba encontrada
-df_mov = normalize_cols(pd.read_excel(xl, sheet_name=sheet_mov, engine="openpyxl"))
-df_pos = normalize_cols(pd.read_excel(xl, sheet_name=sheet_pos, engine="openpyxl")) if sheet_pos else pd.DataFrame()
-df_prov = normalize_cols(pd.read_excel(xl, sheet_name=sheet_pro, engine="openpyxl")) if sheet_pro else pd.DataFrame()
+# junta metadados da esquerda (classe, % carteira, posição)
+meta = ativos[["Ticker","Classe","Pct_Carteira","Posicao"]].copy()
+meta["Pct_Carteira"] = meta["Pct_Carteira"].fillna(0.0)
+tabela = meta.merge(pivot.reset_index(), on="Ticker", how="right").fillna(0.0)
 
 # =========================
-# Normalizações — MOV
+# YIELDS (DY 12m, YOC, Yield do mês)
 # =========================
-# Data
-for c in ["data", "data operação", "data operacao", "data_op", "date"]:
-    if c in df_mov.columns:
-        df_mov["data"] = pd.to_datetime(df_mov[c], errors="coerce")
-        break
-if "data" not in df_mov.columns:
-    df_mov["data"] = pd.NaT
+# janela de 12m a partir do fim do ano selecionado
+jan1 = datetime(int(ano_sel), 1, 1).date()
+dez31 = datetime(int(ano_sel), 12, 31).date()
+ultimos_12m_ini = (datetime(int(ano_sel), 12, 31) - timedelta(days=365)).date()
 
-# Total (valor da linha). Se não tiver "total", tenta preço * quantidade.
-if "total" in df_mov.columns:
-    df_mov["total"] = df_mov["total"].apply(to_float_br)
-else:
-    preco = None
-    for c in ["preco", "preço", "preco unit.", "preço unit.", "preco_unit"]:
-        if c in df_mov.columns:
-            preco = df_mov[c].apply(to_float_br); break
-    qtd = None
-    for c in ["quantidade", "qtd", "qte", "qde"]:
-        if c in df_mov.columns:
-            qtd = pd.to_numeric(df_mov[c], errors="coerce"); break
-    df_mov["total"] = preco * qtd if (preco is not None and qtd is not None) else 0.0
+prov_12m = prov[(prov["Data"].notna()) &
+                (prov["Data"] > ultimos_12m_ini) &
+                (prov["Data"] <= dez31)]
 
-# Tipo (texto da operação)
-if "tipo" not in df_mov.columns:
-    for c in ["movimento", "operation", "operacao", "operação", "tipo operação"]:
-        if c in df_mov.columns:
-            df_mov["tipo"] = df_mov[c]; break
-if "tipo" not in df_mov.columns:
-    df_mov["tipo"] = ""
-df_mov["tipo_norm"] = df_mov["tipo"].astype(str).str.lower().str.strip()
+agg_12m = prov_12m.groupby("Ticker")["Total_Liquido_R$"].sum().reset_index().rename(columns={"Total_Liquido_R$":"Prov_12m_R$"})
 
-# =========================
-# Normalizações — POSIÇÃO
-# =========================
-if not df_pos.empty:
-    if "valor_atual" not in df_pos.columns:
-        qcol = next((c for c in ["quantidade", "qtd"] if c in df_pos.columns), None)
-        pcol = next((c for c in ["preco_atual", "preço_atual", "ultimo_preco", "preco", "preço"] if c in df_pos.columns), None)
-        if qcol and pcol:
-            df_pos["valor_atual"] = pd.to_numeric(df_pos[qcol], errors="coerce") * df_pos[pcol].apply(to_float_br)
-        else:
-            df_pos["valor_atual"] = 0.0
+# último provento por cota no ano (Yield do mês ~ último evento)
+ult_unit = (df.sort_values("Data")
+              .dropna(subset=["Unitario_R$"])
+              .groupby("Ticker")["Unitario_R$"]
+              .last()
+              .reset_index()
+              .rename(columns={"Unitario_R$":"Ultimo_Unitario_R$"}))
 
-# =========================
-# Normalizações — PROVENTOS
-# =========================
-if not df_prov.empty:
-    if "data_com" not in df_prov.columns:
-        for c in ["data com", "com_data"]:
-            if c in df_prov.columns:
-                df_prov["data_com"] = pd.to_datetime(df_prov[c], errors="coerce"); break
-    else:
-        df_prov["data_com"] = pd.to_datetime(df_prov["data_com"], errors="coerce")
+yields = ativos[["Ticker","Qtd_Liquida","PM_Ajustado_R$","Cotacao_R$"]].copy()
+yields = yields.merge(agg_12m, on="Ticker", how="left").merge(ult_unit, on="Ticker", how="left")
+yields["Valor_Atual_R$"] = yields["Cotacao_R$"] * yields["Qtd_Liquida"]
+yields["DY_12m"]  = np.where(yields["Valor_Atual_R$"]>0, yields["Prov_12m_R$"] / yields["Valor_Atual_R$"], np.nan)
+yields["YOC"]     = np.where(yields["PM_Ajustado_R$"]>0, yields["Ultimo_Unitario_R$"] / yields["PM_Ajustado_R$"], np.nan)
+yields["Yield_mensal"] = yields["YOC"]  # interpretamos como yield-on-cost do último pagamento
 
-    if "pagamento" in df_prov.columns:
-        df_prov["pagamento"] = pd.to_datetime(df_prov["pagamento"], errors="coerce")
-
-    if "valor_cota" in df_prov.columns:
-        df_prov["valor_cota"] = df_prov["valor_cota"].apply(to_float_br)
-    if "qtde" in df_prov.columns:
-        df_prov["qtde"] = pd.to_numeric(df_prov["qtde"], errors="coerce")
-    if "total" not in df_prov.columns and {"valor_cota", "qtde"} <= set(df_prov.columns):
-        df_prov["total"] = df_prov["valor_cota"] * df_prov["qtde"]
-
-# =========================
-# Lógica financeira
-# =========================
-DEPOSITOS = {"aporte", "depósito", "deposito", "transferência recebida", "transferencia recebida"}
-RETIRADAS = {"retirada", "saque", "transferência enviada", "transferencia enviada"}
-COMPRAS   = {"compra", "compra - fracionário", "compra - mercado"}
-VENDAS    = {"venda", "venda - fracionário", "venda - mercado"}
-
-st.sidebar.header("Filtros")
-metodo_aporte = st.sidebar.radio(
-    "Como calcular o Aportado (bolso)?",
-    options=["Depósito - Retirada", "Compra - Venda"],
-    index=0,
-)
-
-df_mov["mes"] = pd.to_datetime(df_mov["data"], errors="coerce").dt.to_period("M").dt.to_timestamp()
-
-if metodo_aporte == "Depósito - Retirada":
-    df_mov["aporte_sinal"] = np.select(
-        [df_mov["tipo_norm"].isin(DEPOSITOS), df_mov["tipo_norm"].isin(RETIRADAS)],
-        [df_mov["total"].fillna(0.0), -df_mov["total"].fillna(0.0)],
-        default=0.0
-    )
-else:
-    df_mov["aporte_sinal"] = np.select(
-        [df_mov["tipo_norm"].isin(COMPRAS), df_mov["tipo_norm"].isin(VENDAS)],
-        [df_mov["total"].abs().fillna(0.0), -df_mov["total"].abs().fillna(0.0)],
-        default=0.0
-    )
-
-aportes_m = df_mov.groupby("mes", as_index=False)["aporte_sinal"].sum()
-aportes_m["aportado_acum"] = aportes_m["aporte_sinal"].clip(lower=0).cumsum()
-
-aportado_total = float(aportes_m["aporte_sinal"].sum())
-patrimonio_atual = float(pd.to_numeric(df_pos.get("valor_atual", 0), errors="coerce").sum()) if not df_pos.empty else None
-variacao = (patrimonio_atual - aportado_total) if patrimonio_atual is not None else None
-perc_var = (variacao / aportado_total * 100) if (variacao is not None and aportado_total) else None
-
-if not df_prov.empty and {"pagamento", "total"} <= set(df_prov.columns):
-    prov12 = df_prov.set_index("pagamento").sort_index()
-    prov12 = prov12.last("365D") if len(prov12) else prov12
-    media12 = float(prov12["total"].sum()) / 12 if len(prov12) else 0.0
-    total_prov = float(df_prov["total"].sum())
-else:
-    media12, total_prov = None, None
-
-# Filtro de ano
-anos = sorted(aportes_m["mes"].dt.year.unique())
-ano_sel = st.sidebar.multiselect("Ano", options=anos, default=anos[-1:] if anos else None)
-aportes_plot = aportes_m[aportes_m["mes"].dt.year.isin(ano_sel)] if ano_sel else aportes_m.copy()
-prov_plot = df_prov[df_prov.get("pagamento", pd.NaT).dt.year.isin(ano_sel)] if (not df_prov.empty and "pagamento" in df_prov) else pd.DataFrame()
+tabela = tabela.merge(yields[["Ticker","DY_12m","YOC","Yield_mensal"]], on="Ticker", how="left")
 
 # =========================
 # KPIs
 # =========================
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    st.caption("Variação Patrimonial")
-    if variacao is None:
-        st.metric(" ", "—", "adicione aba de Posição")
-    else:
-        st.metric(" ", moeda(variacao), f"{(perc_var or 0):.2f}%".replace(".", ","))
+c1, c2, c3 = st.columns(3)
+c1.metric("Total no ano selecionado", f"R$ {total_ano:,.2f}".replace(",", "v").replace(".", ",").replace("v", "."))
+c2.metric("Média mensal (12 meses)", f"R$ {media_mensal:,.2f}".replace(",", "v").replace(".", ",").replace("v", "."))
+c3.metric(f"Melhor mês ({melhor_mes_idx})", f"R$ {melhor_mes_val:,.2f}".replace(",", "v").replace(".", ",").replace("v", "."))
 
-with c2:
-    st.caption("Aportado (bolso)")
-    st.metric(" ", moeda(aportado_total))
+st.markdown("### Calendário por Ticker (Jan–Dez)")
+fmt_cols_moeda = COL_ORDEM_MESES + ["Total no ano"]
 
-with c3:
-    st.caption("Patrimônio atual")
-    st.metric(" ", "—" if patrimonio_atual is None else moeda(patrimonio_atual))
+def formatar_moeda(v):
+    try:
+        return "R$ " + f"{float(v):,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
+    except Exception:
+        return v
 
-with c4:
-    st.caption("Proventos (média 12m)")
-    if media12 is None:
-        st.metric(" ", "—", "adicione aba de Proventos")
-    else:
-        st.metric(" ", moeda(media12), f"Total {moeda(total_prov)}")
+tabela_view = tabela.copy()
+for col in fmt_cols_moeda:
+    if col in tabela_view.columns:
+        tabela_view[col] = tabela_view[col].map(formatar_moeda)
+for col in ["Pct_Carteira","DY_12m","YOC","Yield_mensal"]:
+    if col in tabela_view.columns:
+        tabela_view[col] = tabela_view[col].apply(lambda x: "-" if pd.isna(x) else f"{100*float(x):.2f}%")
 
-st.markdown("---")
-
-# =========================
-# Evolução x Calendário
-# =========================
-a, b = st.columns([2, 1])
-
-with a:
-    st.subheader("Evolução Patrimonial")
-    fig = px.bar(aportes_plot, x="mes", y="aportado_acum",
-                 labels={"mes": "", "aportado_acum": "Aportado (Acumulado)"},
-                 template=TEMPLATE)
-    fig.add_scatter(x=aportes_plot["mes"], y=aportes_plot["aportado_acum"],
-                    mode="lines+markers", name="Evolução")
-    fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10), showlegend=True)
-    st.plotly_chart(fig, use_container_width=True)
-
-with b:
-    st.subheader("Calendário de eventos")
-    if not prov_plot.empty and {"pagamento","ticker"}.issubset(prov_plot.columns):
-        hoje = pd.to_datetime(date.today())
-        prox = prov_plot[pd.to_datetime(prov_plot["pagamento"], errors="coerce") >= hoje].copy()
-        prox = prox.sort_values("pagamento").head(8)
-        if len(prox) == 0:
-            st.info("Sem pagamentos futuros nos filtros.")
-        for _, r in prox.iterrows():
-            total = r["total"] if "total" in r else (float(r.get("valor_cota",0))*float(r.get("qtde",0)))
-            st.write(f"**{r.get('ticker','-')}** — {moeda(total)}")
-            dcom = r.get("data_com", pd.NaT)
-            dcom_txt = pd.to_datetime(dcom).date() if pd.notna(dcom) else "-"
-            dpg  = pd.to_datetime(r.get("pagamento", pd.NaT))
-            dpg_txt = dpg.date() if pd.notna(dpg) else "-"
-            st.caption(f"data com: {dcom_txt} | pagamento: {dpg_txt}")
-            st.divider()
-    else:
-        st.info("Proventos indisponíveis (adicione/ajuste a aba).")
+st.dataframe(tabela_view, use_container_width=True, hide_index=True)
 
 # =========================
-# Conferência rápida (opcional)
+# Ranking por Ticker (ano)
 # =========================
-with st.expander("🛠️ Conferência de dados"):
-    st.write("Aportes por mês (fonte do bolso):")
-    st.dataframe(aportes_m)
-    if not df_pos.empty:
-        st.write("Posição (resumo):")
-        st.dataframe(df_pos.head(20))
-    if not df_prov.empty:
-        st.write("Proventos (amostra):")
-        st.dataframe(df_prov.head(20))
+st.markdown("### Ranking de Proventos no Ano")
+ranking = pivot["Total no ano"].sort_values(ascending=False).reset_index()
+ranking.columns = ["Ticker","Total no ano (R$)"]
+ranking["Total no ano (R$)"] = ranking["Total no ano (R$)"].map(formatar_moeda)
+st.dataframe(ranking, use_container_width=True, hide_index=True)
+
+# =========================
+# Exportação
+# =========================
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="Calendario")
+    return out.getvalue()
+
+col_b1, col_b2 = st.columns(2)
+with col_b1:
+    st.download_button(
+        "⬇️ Baixar Calendário (Excel)",
+        data=to_excel_bytes(tabela),
+        file_name=f"calendario_proventos_{ano_sel}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+with col_b2:
+    st.download_button(
+        "⬇️ Baixar Ranking (CSV)",
+        data=ranking.to_csv(index=False).encode("utf-8"),
+        file_name=f"ranking_proventos_{ano_sel}.csv",
+        mime="text/csv"
+    )
+
+st.caption("Fonte: abas **3. Proventos** e **1. Meus Ativos** da sua planilha. O app respeita exatamente os valores lançados por você (não recalcula impostos).")
