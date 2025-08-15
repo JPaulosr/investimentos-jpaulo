@@ -192,6 +192,7 @@ def load_proventos(sheet_id: str) -> pd.DataFrame:
     df = carregar_tabela(sheet_id, PROVENTOS_ALVOS, GID_PROVENTOS)
     df = realinha_cabecalho(df)
 
+    # Mapear colunas de forma flexível
     col_ticker    = pick_col(df, ["Ticker"])
     col_tipo      = pick_col(df, ["Tipo Provento", "Tipo", "Provento"])
     col_data      = pick_col(df, ["Data"])
@@ -218,33 +219,39 @@ def load_proventos(sheet_id: str) -> pd.DataFrame:
     if col_mes:       rename[col_mes]       = "Mes"
     if col_ano:       rename[col_ano]       = "Ano"
     if col_classe:    rename[col_classe]    = "Classe"
-
     df = df.rename(columns=rename)
 
-    required = [
-        "Ticker", "Tipo", "Data", "Quantidade", "Unitario_R$",
-        "Total_Liquido_R$", "IRRF", "PTAX", "Total_Bruto_R$",
-        "Mes", "Ano", "Classe"
-    ]
+    # Garante todas as colunas (evita KeyError)
+    required = ["Ticker","Tipo","Data","Quantidade","Unitario_R$","Total_Liquido_R$",
+                "IRRF","PTAX","Total_Bruto_R$","Mes","Ano","Classe"]
     for c in required:
         if c not in df.columns:
             df[c] = np.nan
 
+    # Limpeza/conversões
     df["Data"] = df["Data"].map(to_date_br)
     df["Quantidade"] = df["Quantidade"].map(to_int_safe)
-    for c in ["Unitario_R$", "Total_Liquido_R$", "Total_Bruto_R$", "IRRF", "PTAX"]:
+    for c in ["Unitario_R$","Total_Liquido_R$","Total_Bruto_R$","IRRF","PTAX"]:
         df[c] = df[c].map(to_float_br)
 
+    # >>> FIX AQUI: preencher Ano/Mês usando Series alinhadas (sem listas)
     if df["Data"].notna().any():
-        df.loc[df["Ano"].isna(), "Ano"] = [d.year if pd.notna(d) else np.nan for d in df["Data"]]
-        df.loc[df["Mes"].isna(), "Mes"] = [MESES_PT.get(d.month) if pd.notna(d) else np.nan for d in df["Data"]]
+        ano_series = df["Data"].apply(lambda d: d.year if pd.notna(d) else np.nan)
+        mes_series = df["Data"].apply(lambda d: MESES_PT.get(d.month) if pd.notna(d) else np.nan)
 
+        df["Ano"] = pd.to_numeric(df["Ano"], errors="coerce")
+        df["Ano"] = df["Ano"].fillna(ano_series)     # alinha por índice
+        df["Mes"] = df["Mes"].fillna(mes_series)     # idem
+    # <<< FIM DO FIX
+
+    # Calcula Total_Liquido_R$ quando possível
     have_qtd = df["Quantidade"].notna()
     have_uni = df["Unitario_R$"].notna()
     need_calc = df["Total_Liquido_R$"].isna() & have_qtd & have_uni
     df.loc[need_calc, "Total_Liquido_R$"] = df.loc[need_calc, "Quantidade"] * df.loc[need_calc, "Unitario_R$"]
     df.loc[need_calc & df["IRRF"].notna(), "Total_Liquido_R$"] -= df.loc[need_calc & df["IRRF"].notna(), "IRRF"]
 
+    # Finalizações
     df = df[df["Ticker"].astype(str).str.strip() != ""].copy()
     df["Classe"] = df["Classe"].fillna("")
     return df
