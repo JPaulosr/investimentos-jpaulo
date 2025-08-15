@@ -23,15 +23,15 @@ st.title("📈 Painel de Investimentos – Linkado ao Google Sheets")
 # ID da sua planilha (o que vai entre /d/ e /edit)
 SHEET_ID = "1p9IzDr-5ZV0phUHfNA_9d5xNvZW1IRo84LA__JyiiQc"
 
-# Se já souber os GIDs, coloque aqui para leitura via export CSV (mais rápido)
+# GIDs reais das suas abas:
 GIDS = {
-    # Ex.: "1. Carteira": "123456789",
-    # Ex.: "Proventos (B3)": "987654321",
+    "Carteira": "441194831",     # Aba "1. Meus Ativos"
+    "Proventos": "2109089485",   # Aba "3. Proventos"
 }
 
-# Nomes candidatos de abas (a função tenta por GID, depois por nome)
-ABAS_CARTEIRA = ["1. Carteira", "Carteira", "Resumo Carteira"]
-ABAS_PROVENTOS = ["Proventos", "Proventos (B3)", "2. Proventos", "Dividendos"]
+# Nomes exatos das abas (também usados como fallback por nome)
+ABAS_CARTEIRA = ["1. Meus Ativos"]
+ABAS_PROVENTOS = ["3. Proventos"]
 
 PLOTLY_TEMPLATE = "plotly_dark"
 
@@ -44,16 +44,17 @@ def _csv_url_by_gid(sheet_id: str, gid: str) -> str:
 
 @st.cache_data(ttl=300)
 def _csv_url_by_name(sheet_id: str, sheet_name: str) -> str:
-    # usa o endpoint gviz com ?sheet=<nome> URL-encoded
     encoded = urllib.parse.quote(sheet_name, safe="")
     return f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={encoded}"
 
 @st.cache_data(ttl=300)
 def ler_aba(sheet_id: str, candidatos: list[str], gids: dict[str, str], dtype=str) -> pd.DataFrame:
-    # 1) tenta por GID (se existir no dict) respeitando a ordem dos candidatos
+    # 1) tenta por GID (prioritário e mais robusto)
     for nome in candidatos:
-        if nome in gids:
-            url = _csv_url_by_gid(sheet_id, gids[nome])
+        # mapeia "Carteira" ou "Proventos" para seus GIDs
+        chave_gid = "Carteira" if "Meus Ativos" in nome else ("Proventos" if "Proventos" in nome else None)
+        if chave_gid and chave_gid in gids:
+            url = _csv_url_by_gid(sheet_id, gids[chave_gid])
             try:
                 df = pd.read_csv(url, dtype=dtype)
                 if not df.empty:
@@ -62,7 +63,7 @@ def ler_aba(sheet_id: str, candidatos: list[str], gids: dict[str, str], dtype=st
             except Exception:
                 pass
 
-    # 2) tenta por NOME (gviz)
+    # 2) fallback por NOME (gviz)
     for nome in candidatos:
         url = _csv_url_by_name(sheet_id, nome)
         try:
@@ -102,7 +103,6 @@ def parse_int(x):
         return pd.NA
 
 def parse_date(x):
-    # aceita dd/mm/aaaa, aaaa-mm-dd etc.
     try:
         return pd.to_datetime(x, dayfirst=True, errors="coerce")
     except Exception:
@@ -125,9 +125,9 @@ def padronizar_proventos(df_pv_raw: pd.DataFrame) -> pd.DataFrame:
     mapa = {
         "data": ["Data", "data", "Data do Crédito", "Data Crédito", "Data Credito"],
         "ticker": ["Ticker", "Ativo", "Código", "Código de Negociação", "Codigo"],
-        "tipo": ["Tipo", "Tipo de Provento", "Evento"],
+        "tipo": ["Tipo", "Tipo de Provento", "Evento", "Tipo Provento"],
         "quantidade": ["Qtd", "Quantidade", "QTD"],
-        "valor": ["Valor Líquido", "Valor", "Total Líquido", "Provento Líquido", "Total"],
+        "valor": ["Total Líquido R$", "Valor Líquido", "Valor", "Total Líquido", "Provento Líquido", "Total"],
         "instituicao": ["Instituição", "Corretora", "Conta"],
         "corretagem": ["Corretagem", "Taxa de Corretagem"],
         "impostos": ["Impostos", "IR", "Taxas/Impostos", "IRRF"],
@@ -140,7 +140,7 @@ def padronizar_proventos(df_pv_raw: pd.DataFrame) -> pd.DataFrame:
         if col_origem is not None:
             out[destino] = df_pv_raw[col_origem]
         else:
-            out[destino] = pd.NA  # vetor <NA> do mesmo tamanho (N), não escalar
+            out[destino] = pd.NA  # vetor <NA> do mesmo tamanho, evitando escalares
 
     # Normalizações
     out["data"] = out["data"].apply(parse_date)
@@ -164,13 +164,13 @@ def padronizar_proventos(df_pv_raw: pd.DataFrame) -> pd.DataFrame:
                  "corretagem", "impostos", "instituicao"]
     out = out[col_ordem]
 
-    # opcional: limpa linhas totalmente vazias (sem data e sem valor)
+    # remove linhas totalmente vazias (sem data e sem valor)
     out = out[~(out["data"].isna() & out["valor"].isna())].reset_index(drop=True)
 
     return out
 
 # =============================================================================
-# Padronização de Carteira (opcional, simples)
+# Padronização de Carteira
 # =============================================================================
 def padronizar_carteira(df_raw: pd.DataFrame) -> pd.DataFrame:
     if df_raw is None or df_raw.empty:
@@ -180,11 +180,11 @@ def padronizar_carteira(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     mapa = {
         "ticker": ["Ticker", "Ativo", "Código", "Codigo"],
-        "qtde": ["Quantidade", "Qtd", "QTD"],
-        "pm": ["PM", "Preço Médio", "Preco Medio"],
-        "preco_atual": ["Preço Atual", "Cotação", "Preco Atual", "Cotacao"],
-        "valor_posicao": ["Valor da Posição", "Valor Posicao", "Valor"],
-        "setor": ["Setor", "Segmento"]
+        "qtde": ["Quantidade (Liquida)", "Quantidade", "Qtd", "QTD"],
+        "pm": ["Preço Médio Ajustado R$", "PM", "Preço Médio", "Preco Medio"],
+        "preco_atual": ["Valor Atual", "Preço Atual", "Cotação", "Preco Atual", "Cotacao"],
+        "valor_posicao": ["Valor Investido", "Valor da Posição", "Valor Posicao", "Valor"],
+        "setor": ["Setor", "Classe", "Segmento"]
     }
 
     out = pd.DataFrame(index=df_raw.index)
@@ -216,7 +216,7 @@ with st.expander("🔎 Diagnóstico das abas (colunas lidas)", expanded=False):
     st.write("**Carteira (raw):**", df_cart_raw.shape)
     if not df_cart_raw.empty:
         st.write(list(df_cart_raw.columns))
-        st.dataframe(df_cart_raw.head(10))
+        st.dataframe(df_cart_raw.head(10), use_container_width=True)
     else:
         st.warning("Aba de **Carteira** não encontrada por GID nem por nome (verifique `GIDS` e nomes candidatos).")
 
@@ -224,7 +224,7 @@ with st.expander("🔎 Diagnóstico das abas (colunas lidas)", expanded=False):
     st.write("**Proventos (raw):**", df_pv_raw.shape)
     if not df_pv_raw.empty:
         st.write(list(df_pv_raw.columns))
-        st.dataframe(df_pv_raw.head(10))
+        st.dataframe(df_pv_raw.head(10), use_container_width=True)
     else:
         st.warning("Aba de **Proventos** não encontrada por GID nem por nome (verifique `GIDS` e nomes candidatos).")
 
@@ -233,7 +233,7 @@ CARTEIRA = padronizar_carteira(df_cart_raw)
 PROVENTOS = padronizar_proventos(df_pv_raw)
 
 # =============================================================================
-# UI / Resultados básicos (você pode evoluir daqui)
+# UI / Resultados básicos
 # =============================================================================
 col1, col2 = st.columns(2)
 
@@ -243,7 +243,6 @@ with col1:
         st.info("Nenhum dado de Carteira disponível.")
     else:
         st.dataframe(CARTEIRA, use_container_width=True)
-        # KPIs simples
         total_posicao = (CARTEIRA["valor_posicao"].fillna(0)).sum()
         total_qtde = (CARTEIRA["qtde"].fillna(0)).sum()
         m1, m2 = st.columns(2)
@@ -256,7 +255,6 @@ with col2:
         st.info("Nenhum dado de Proventos disponível.")
     else:
         st.dataframe(PROVENTOS, use_container_width=True)
-        # agregado por ano
         proventos_validos = PROVENTOS.dropna(subset=["data", "valor"]).copy()
         proventos_validos["ano"] = proventos_validos["data"].dt.year
         agg = proventos_validos.groupby("ano", dropna=True)["valor"].sum().reset_index()
@@ -265,4 +263,4 @@ with col2:
         total_prov = float(proventos_validos["valor"].sum() or 0.0)
         st.metric("Total de proventos", f"R$ {total_prov:,.2f}".replace(",", "v").replace(".", ",").replace("v", "."))
 
-st.caption("Dica: se alguma aba não carregar, preencha o dicionário `GIDS` com o gid exato e/ou ajuste os nomes candidatos em `ABAS_CARTEIRA` e `ABAS_PROVENTOS`.")
+st.caption("Se alguma aba não carregar, confira `SHEET_ID`, `GIDS` e os nomes em `ABAS_CARTEIRA` / `ABAS_PROVENTOS`.")
