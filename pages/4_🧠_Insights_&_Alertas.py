@@ -1,8 +1,7 @@
-# pages/0_🧠_Insights_&_Alertas.py — feed limpo + ordenação corrigida
+# pages/0_🧠_Insights_&_Alertas.py — Insights baseados em VALOR POR COTA (Unitário R$)
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import timedelta
 
 st.set_page_config(page_title="🧠 Insights & Alertas", page_icon="🧠", layout="wide")
 st.title("🧠 Insights & Alertas")
@@ -39,8 +38,8 @@ def _find_header_row(values, expect_cols):
     for i,row in enumerate(values):
         row_low = [str(c).strip().lower() for c in row]
         hits = sum(1 for e in exp if e in row_low)
-        if hits > hits_best: best, hits_best = i, hits
         if hits >= 2: return i
+        if hits > hits_best: best, hits_best = i, hits
     return best
 
 def read_ws(sheet_id, aba):
@@ -62,10 +61,12 @@ def read_ws(sheet_id, aba):
     if not vals: return pd.DataFrame()
     if "provento" in ws.title.lower():
         hdr = _find_header_row(vals, ["Ticker","Tipo Provento","Data"])
+    elif "meus ativos" in ws.title.lower() or "ativo" in ws.title.lower():
+        hdr = _find_header_row(vals, ["Ticker","Valor Investido","Valor Atual"])
     else:
-        hdr = _find_header_row(vals, [c for c in vals[0] if str(c).strip()])
-    cols = vals[hdr]
-    df = pd.DataFrame(vals[hdr+1:], columns=[c.strip() for c in cols])
+        hdr = 0
+    cols = [c.strip() for c in vals[hdr]]
+    df = pd.DataFrame(vals[hdr+1:], columns=cols)
     df = df.replace({"": None}).dropna(axis=1, how="all").dropna(axis=0, how="all")
     return df
 
@@ -109,8 +110,11 @@ def padronizar_proventos(df):
     for c in ["Valor","Quantidade","Unitario"]:
         if c in out.columns:
             out[c] = out[c].map(br_to_float)
-    if ("Valor" not in out.columns or out["Valor"].isna().all()) and {"Quantidade","Unitario"}.issubset(out.columns):
-        out["Valor"] = out["Quantidade"].fillna(0)*out["Unitario"].fillna(0)
+    # fallback Unitário = Valor/Quantidade quando não preenchido
+    if "Unitario" in out.columns and "Quantidade" in out.columns and "Valor" in out.columns:
+        mask = out["Unitario"].isna() | (out["Unitario"]==0)
+        out.loc[mask & out["Quantidade"].notna() & (out["Quantidade"]!=0) & out["Valor"].notna(),
+                "Unitario"] = out["Valor"] / out["Quantidade"]
     return out
 
 # ------------------ Carregar ------------------
@@ -129,90 +133,126 @@ if PV.empty:
 # ------------------ Sidebar: parâmetros ------------------
 with st.sidebar:
     st.header("Parâmetros de Alerta")
-    meses_lookback = st.slider("Histórico para médias (meses)", 3, 18, 6)
-    corte_down = st.slider("⚠️ Alerta se queda mensal > (%)", 5, 80, 20)
-    alta_up    = st.slider("🎉 Sinal se alta mensal > (%)", 5, 80, 20)
-    meses_sem_pagar = st.slider("⏰ Alerta se ficar sem pagar (meses)", 1, 6, 2)
-    topN_conc = st.slider("Top-N p/ concentração", 3, 10, 5)
-    alvo_conc = st.slider("Limite de concentração Top-N (%)", 20, 90, 40)
-    alvo_yoc  = st.number_input("Meta Yield on Cost (a.a. %)", value=8.0, step=0.5)
+    meses_lookback   = st.slider("Histórico para médias (meses)", 3, 18, 6)
+    corte_down       = st.slider("⚠️ Alerta se corte no unitário > (%)", 5, 80, 20)
+    alta_up          = st.slider("🎉 Sinal se aumento no unitário > (%)", 5, 80, 20)
+    meses_sem_pagar  = st.slider("⏰ Alerta se ficar sem pagar (meses)", 1, 6, 2)
+    topN_conc        = st.slider("Top-N p/ concentração", 3, 10, 5)
+    alvo_conc        = st.slider("Limite de concentração Top-N (%)", 20, 90, 40)
+    alvo_yoc         = st.number_input("Meta Yield on Cost (a.a. %)", value=8.0, step=0.5)
     st.session_state["yoc_meta"] = alvo_yoc
 
-# ------------------ Séries mensais ------------------
+# ------------------ Séries mensais (UNITÁRIO por cota e VALOR total) ------------------
 PVm = PV.dropna(subset=["Data"]).copy()
 PVm["Competencia"] = pd.to_datetime(PVm["Data"].dt.strftime("%Y-%m-01"))
-m_ticker = PVm.groupby(["Competencia","Ticker"], dropna=False)["Valor"].sum().reset_index()
 
-def expand_months(df, key_col):
+def unitario_seguro(row):
+    u = row.get("Unitario")
+    if pd.isna(u) or u == 0:
+        v, q = row.get("Valor"), row.get("Quantidade")
+        try:
+            return float(v) / float(q) if (pd.notna(v) and pd.notna(q) and float(q) != 0) else np.nan
+        except Exception:
+            return np.nan
+    return float(u)
+
+PVm["UnitarioOK"] = PVm.apply(unitario_seguro, axis=1)
+
+# 1) UNITÁRIO por mês/ticker (média do mês, ignorando zeros/nulos)
+m_unit = (
+    PVm.groupby(["Competencia", "Ticker"], dropna=False)["UnitarioOK"]
+       .apply(lambda s: s.dropna().astype(float).replace(0, np.nan).mean())
+       .reset_index()
+       .rename(columns={"UnitarioOK": "Unitario"})
+)
+
+# 2) VALOR total por mês/ticker (para yields/resumos)
+m_valor = PVm.groupby(["Competencia", "Ticker"], dropna=False)["Valor"].sum().reset_index()
+
+def expand_months(df, key_col, value_col):
+    """Preenche meses ausentes com 0 (sem pagamento)."""
     full = []
     for k, sub in df.groupby(key_col):
-        idx = pd.period_range(sub["Competencia"].min(), sub["Competencia"].max(), freq="M").to_timestamp()
-        s = sub.set_index("Competencia")["Valor"].reindex(idx, fill_value=0.0)\
-              .rename("Valor").reset_index().rename(columns={"index":"Competencia"})
+        if sub.empty:
+            continue
+        start, end = sub["Competencia"].min(), sub["Competencia"].max()
+        idx = pd.period_range(start, end, freq="M").to_timestamp()
+        s = sub.set_index("Competencia")[value_col].reindex(idx, fill_value=0.0)\
+               .rename(value_col).reset_index().rename(columns={"index":"Competencia"})
         s[key_col] = k
         full.append(s)
     return pd.concat(full, ignore_index=True) if full else df
 
-m_ticker_full = expand_months(m_ticker, "Ticker")
-ultima_comp = PVm["Competencia"].max()
-janela12 = ultima_comp - pd.DateOffset(months=12)
+m_unit_full  = expand_months(m_unit,  "Ticker", "Unitario")
+m_valor_full = expand_months(m_valor, "Ticker", "Valor")
 
-# ------------------ Geração de sinais ------------------
+ultima_comp = PVm["Competencia"].max()
+janela12    = ultima_comp - pd.DateOffset(months=12)
+
+# ------------------ Geração de sinais (com UNITÁRIO) ------------------
 rows = []
 def add_signal(cat, tipo, ticker, score, msg):
     rows.append({
         "categoria": cat,      # "Alerta", "Sinal", "Obs"
         "tipo": tipo,          # queda_mensal, alta_mensal, etc.
         "ticker": ticker,
-        "score": float(score) if pd.notna(score) else 0.0,  # garantir numérico
+        "score": float(score) if pd.notna(score) else 0.0,
         "mensagem": msg
     })
 
-# 1) MoM e vs média N meses
-for tkr, sub in m_ticker_full.groupby("Ticker"):
+# 1) MoM e desvio vs média (unitário por cota)
+for tkr, sub in m_unit_full.groupby("Ticker"):
     sub = sub.sort_values("Competencia")
     if len(sub) < 2: 
         continue
-    sub["MoM"] = sub["Valor"].pct_change()
-    sub["MA"]  = sub["Valor"].rolling(meses_lookback, min_periods=1).mean()
-    v_atual = sub["Valor"].iloc[-1]
-    mom = sub["MoM"].iloc[-1] or 0
-    desv = (v_atual - (sub["MA"].iloc[-1] or 0)) / (sub["MA"].iloc[-1] or 1e-9)
+    sub["MoM"] = sub["Unitario"].pct_change()
+    sub["MA"]  = sub["Unitario"].rolling(meses_lookback, min_periods=1).mean()
 
-    if mom <= -(corte_down/100):
-        add_signal("Alerta", "queda_mensal", tkr, min(1.0, abs(mom)),
-                   f"🔻 **{tkr}** caiu **{mom*100:.1f}%** vs mês anterior.")
-    if mom >= (alta_up/100):
-        add_signal("Sinal", "alta_mensal", tkr, min(1.0, mom),
-                   f"📈 **{tkr}** subiu **{mom*100:.1f}%** vs mês anterior.")
-    if abs(desv) >= 0.2:
+    u_atual = float(sub["Unitario"].iloc[-1])
+    mom     = float(sub["MoM"].iloc[-1] or 0)
+    base_ma = float(sub["MA"].iloc[-1] or 0)
+
+    # desvio vs média N meses
+    desv = (u_atual - base_ma) / (base_ma if base_ma != 0 else 1e-9)
+
+    # cortes/aumentos (evita inf quando mês anterior era zero)
+    if not np.isinf(mom) and not np.isnan(mom):
+        if mom <= -(corte_down/100):
+            add_signal("Alerta", "queda_mensal", tkr, min(1.0, abs(mom)),
+                       f"🔻 **{tkr}** cortou **{mom*100:.1f}%** no valor por cota vs mês anterior.")
+        if mom >= (alta_up/100):
+            add_signal("Sinal", "alta_mensal", tkr, min(1.0, mom),
+                       f"📈 **{tkr}** aumentou **{mom*100:.1f}%** no valor por cota vs mês anterior.")
+
+    # desvio relevante vs média
+    if abs(desv) >= 0.2 and not np.isnan(desv):
         arrow = "↑" if desv>0 else "↓"
         cat = "Sinal" if desv>0 else "Alerta"
         add_signal(cat, "desvio_media", tkr, min(1.0, abs(desv)),
-                   f"{arrow} **{tkr}** ficou **{desv*100:.1f}%** {'acima' if desv>0 else 'abaixo'} da média {meses_lookback}m.")
+                   f"{arrow} **{tkr}** ficou **{desv*100:.1f}%** {'acima' if desv>0 else 'abaixo'} da média {meses_lookback}m (R$/cota).")
 
-# 2) Meses sem pagar
-for tkr, sub in m_ticker_full.groupby("Ticker"):
+# 2) Meses sem pagar (unitário > 0)
+for tkr, sub in m_unit_full.groupby("Ticker"):
     sub = sub.sort_values("Competencia")
-    ult_pag = sub.loc[sub["Valor"]>0, "Competencia"].max()
-    if pd.isna(ult_pag): 
+    ult_pag = sub.loc[sub["Unitario"]>0, "Competencia"].max()
+    if pd.isna(ult_pag):
         continue
     gap = (ultima_comp.to_period("M") - ult_pag.to_period("M")).n
     if gap >= meses_sem_pagar:
         add_signal("Alerta", "sem_pagar", tkr, min(1.0, gap/6),
                    f"⏰ **{tkr}** está há **{gap}** mês(es) sem pagar.")
 
-# 3) Máx/Mín 12m
-for tkr, sub in m_ticker_full.groupby("Ticker"):
+# 3) Máximo/Mínimo 12m (unitário)
+for tkr, sub in m_unit_full.groupby("Ticker"):
     sub12 = sub[sub["Competencia"]>=janela12]
     if sub12.empty: continue
-    v = sub12["Valor"].iloc[-1]
-    if v>0 and v == sub12["Valor"].max():
-        add_signal("Sinal","novo_max",tkr,0.6,f"🏆 **{tkr}** marcou **máximo de 12m** no provento mensal.")
-    if v>0 and v == sub12["Valor"].min():
-        add_signal("Obs","novo_min",tkr,0.4,f"⚠️ **{tkr}** marcou **mínimo de 12m** no provento mensal.")
+    v = float(sub12["Unitario"].iloc[-1])
+    if v>0 and v == sub12["Unitario"].max():
+        add_signal("Sinal","novo_max",tkr,0.6,f"🏆 **{tkr}** marcou **máximo de 12m** no valor por cota.")
+    if v>0 and v == sub12["Unitario"].min():
+        add_signal("Obs","novo_min",tkr,0.4,f"⚠️ **{tkr}** marcou **mínimo de 12m** no valor por cota.")
 
-# 4) Concentração da carteira
+# 4) Concentração da carteira (valor atual)
 if not dfA.empty and {"Ticker","ValorAtual"}.issubset(dfA.columns):
     aloc = dfA.groupby("Ticker", dropna=False)["ValorAtual"].sum().sort_values(ascending=False)
     top = aloc.head(topN_conc)
@@ -222,18 +262,20 @@ if not dfA.empty and {"Ticker","ValorAtual"}.issubset(dfA.columns):
         add_signal("Alerta","concentracao",",".join(top.index[:3]),min(1.0, perc/100),
                    f"🎯 **Concentração**: Top {topN_conc} = **{perc:.1f}%** (limite {alvo_conc}%).")
 
-# 5) Yield 12m / Yield on Cost
+# 5) Yield 12m / Yield-on-Cost (usam VALOR total 12m)
 if not dfA.empty:
     pv12 = PVm[PVm["Competencia"]>=janela12].groupby("Ticker")["Valor"].sum()
     if "ValorInvestido" in dfA.columns:
         yoc = (pv12 / (dfA.set_index("Ticker")["ValorInvestido"]+1e-9)*100).dropna()
         for tkr, yy in yoc.items():
             if yy >= st.session_state.get("yoc_meta", 8.0):
-                add_signal("Sinal","yoc_ok",tkr,min(1.0, yy/20),f"💵 **{tkr}** Yield-on-Cost 12m = **{yy:.1f}% a.a.**.")
+                add_signal("Sinal","yoc_ok",tkr,min(1.0, yy/20),
+                           f"💵 **{tkr}** Yield-on-Cost 12m = **{yy:.1f}% a.a.**.")
     if "ValorAtual" in dfA.columns:
         ya = (pv12 / (dfA.set_index("Ticker")["ValorAtual"]+1e-9)*100).dropna().sort_values(ascending=False).head(5)
         for tkr, yy in ya.items():
-            add_signal("Obs","yield_atual",tkr,0.5,f"📊 **{tkr}** Yield 12m / ValorAtual = **{yy:.1f}% a.a.**")
+            add_signal("Obs","yield_atual",tkr,0.5,
+                       f"📊 **{tkr}** Yield 12m / ValorAtual = **{yy:.1f}% a.a.**")
 
 feed = pd.DataFrame(rows)
 if feed.empty:
@@ -255,7 +297,7 @@ sev_min = colf1.slider("Severidade mínima", 0.0, 1.0, 0.2, 0.05)
 cats = colf2.multiselect("Categorias", ["Alerta","Sinal","Obs"], default=["Alerta","Sinal","Obs"])
 busca = colf3.text_input("Buscar ticker (ex.: HGLG11)", "").strip().upper()
 
-# aplica filtros (com patch do sort)
+# aplica filtros + ordenação estável
 view = feed.copy()
 view["score"] = pd.to_numeric(view.get("score", 0), errors="coerce").fillna(0.0)
 view = view[view["score"] >= sev_min]
@@ -263,7 +305,6 @@ view = view[view["categoria"].isin(cats)]
 if busca:
     view = view[view["ticker"].str.contains(busca, na=False)]
 
-# --- ordenação segura por tipo ---
 ordem_tipo = {
     "queda_mensal": 0, "desvio_media": 1, "sem_pagar": 2, "concentracao": 3,
     "alta_mensal": 4, "novo_min": 5, "novo_max": 6, "yoc_ok": 7, "yield_atual": 8
@@ -272,22 +313,20 @@ view["ordem_tipo"] = view["tipo"].map(ordem_tipo).fillna(99).astype(int)
 view = view.sort_values(
     by=["categoria", "ordem_tipo", "score"],
     ascending=[True, True, False],
-    kind="mergesort"  # estável
+    kind="mergesort"
 ).reset_index(drop=True)
 
-# contadores por categoria (para mostrar nas abas)
+# contadores por categoria para os títulos das abas
 n_alert = int((view["categoria"]=="Alerta").sum())
 n_sinal = int((view["categoria"]=="Sinal").sum())
 n_obs   = int((view["categoria"]=="Obs").sum())
 
-# abas por categoria (com contadores)
 tab_alerta, tab_sinal, tab_obs = st.tabs([f"⚠️ Alertas ({n_alert})", f"🎉 Sinais ({n_sinal})", f"ℹ️ Observações ({n_obs})"])
 
 def render_feed(df, empty_msg):
     if df.empty:
         st.caption(empty_msg)
         return
-    # agrupa por ticker e mostra cards
     for tkr, sub in df.groupby("ticker"):
         sub = sub.sort_values("score", ascending=False)
         with st.expander(f"{tkr} — {len(sub)} item(ns)", expanded=False):
@@ -311,30 +350,36 @@ st.download_button(
 st.divider()
 st.subheader("Resumos rápidos")
 
-# Top quedas / altas (mês atual vs anterior)
-m_full = m_ticker_full.sort_values("Competencia")
-ult = m_full.groupby("Ticker").tail(2).groupby("Ticker")["Valor"].apply(lambda s: s.iloc[-1] - s.iloc[0]).rename("Delta")
-mom_df = m_full.groupby("Ticker")["Valor"].apply(lambda s: s.pct_change().iloc[-1] if len(s)>1 else np.nan).rename("MoM")
-mom_tab = pd.concat([ult, mom_df], axis=1).dropna().reset_index()
-mom_tab["MoM%"] = (mom_tab["MoM"]*100).round(1)
+# ----- Resumo por UNITÁRIO (o que importa para aumentos/ cortes) -----
+m_unit_full_sorted = m_unit_full.sort_values("Competencia")
+def mom_pct_unit(s):
+    return s.pct_change().iloc[-1] if len(s)>1 else np.nan
+mom_unit = m_unit_full_sorted.groupby("Ticker")["Unitario"].apply(mom_pct_unit).dropna().reset_index()
+mom_unit["MoM% (R$/cota)"] = (mom_unit["Unitario"]*100).round(1)  # coluna renomeada na sequência
+
+mom_unit = mom_unit.rename(columns={"Unitario": "MoM"})
+mom_unit["MoM% (R$/cota)"] = (mom_unit["MoM"]*100).round(1)
 
 colA, colB, colC = st.columns(3)
 with colA:
-    st.caption("🔻 Maiores quedas (MoM)")
-    st.dataframe(mom_tab.sort_values("MoM").head(10)[["Ticker","MoM%"]],
+    st.caption("🔻 Maiores cortes (MoM) — Unitário")
+    st.dataframe(mom_unit.sort_values("MoM").head(10)[["Ticker","MoM% (R$/cota)"]],
                  hide_index=True, use_container_width=True)
 with colB:
-    st.caption("📈 Maiores altas (MoM)")
-    st.dataframe(mom_tab.sort_values("MoM", ascending=False).head(10)[["Ticker","MoM%"]],
+    st.caption("📈 Maiores aumentos (MoM) — Unitário")
+    st.dataframe(mom_unit.sort_values("MoM", ascending=False).head(10)[["Ticker","MoM% (R$/cota)"]],
                  hide_index=True, use_container_width=True)
+
 with colC:
     st.caption("⏰ Sem pagar (gap ≥ parâmetro)")
     gaps = []
-    for tkr, sub in m_ticker_full.groupby("Ticker"):
-        last_pay = sub.loc[sub["Valor"]>0, "Competencia"].max()
+    for tkr, sub in m_unit_full.groupby("Ticker"):
+        last_pay = sub.loc[sub["Unitario"]>0, "Competencia"].max()
         if pd.isna(last_pay): continue
         gap = (ultima_comp.to_period("M") - last_pay.to_period("M")).n
         if gap >= meses_sem_pagar:
             gaps.append({"Ticker": tkr, "Meses": gap})
     st.dataframe(pd.DataFrame(gaps).sort_values("Meses", ascending=False),
                  hide_index=True, use_container_width=True)
+
+st.caption("Obs.: Sinais/alertas usam **valor por cota (Unitário R$)**; métricas de yield continuam usando **valor total**.")
