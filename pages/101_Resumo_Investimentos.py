@@ -1,11 +1,11 @@
 # 101_Resumo_Investimentos.py
-# Proventos & Calendário — conectado às abas APP_Proventos e APP_MeusAtivos
-# - Acesso robusto: Service Account (secrets) -> CSV por nome -> CSV por GID
-# - Realinha cabeçalho quando há linhas antes da tabela
-# - Evita IntCastingNaNError (usa 'Ano_num')
-# - Recalcula Total_Liquido_R$ (Qtd * Unitário - IRRF)
-# - Recalcula Pct_Carteira de forma robusta
-# - KPIs, Pivot Jan–Dez, DY/YOC/Yield do mês, exportações e diagnóstico
+# Proventos & Calendário — APP_Proventos + APP_MeusAtivos
+# - Acesso robusto (Service Account -> CSV por nome -> CSV por GID)
+# - Realinha cabeçalho
+# - Total de proventos = Quantidade × Unitário R$ − IRRF (sempre)
+# - Guarda também o Total_Liquido_Orig_R$ (se existir) para AUDITORIA
+# - Recalcula % na carteira com base em Valor Atual (ou Investido)
+# - Fallback de download: openpyxl -> CSV
 
 import streamlit as st
 import pandas as pd
@@ -15,22 +15,15 @@ from io import BytesIO
 from urllib.parse import quote
 from datetime import datetime, timedelta
 
-# =========================
-# CONFIG
-# =========================
 st.set_page_config(page_title="Proventos & Calendário", page_icon="💸", layout="wide")
 st.title("💸 Proventos & Calendário")
 
-# Seu ID da planilha "cópia"
+# === CONFIG ===
 SHEET_ID = "1TQBzbueeBTgNmXwZPg04GFOwNL4vh_1ZbKlDAGQJ09o"
-
-# Abas-alvo (nomes "limpos")
 PROVENTOS_ALVOS   = ["APP_Proventos"]
 MEUS_ATIVOS_ALVOS = ["APP_MeusAtivos"]
-
-# (opcional) GIDs — úteis se renomear as abas
-GID_PROVENTOS   = "2109089485"  # APP_Proventos
-GID_MEUS_ATIVOS = None          # preencha se quiser
+GID_PROVENTOS   = "2109089485"
+GID_MEUS_ATIVOS = None
 
 MESES_PT = {
     1: "janeiro", 2: "fevereiro", 3: "março", 4: "abril",
@@ -39,9 +32,7 @@ MESES_PT = {
 }
 COL_ORDEM_MESES = list(MESES_PT.values())
 
-# =========================
-# HELPERS
-# =========================
+# === HELPERS ===
 def csv_url_by_name(sheet_id: str, sheet_name: str) -> str:
     return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&sheet={quote(sheet_name)}"
 
@@ -52,59 +43,42 @@ def to_float_br(x):
     if pd.isna(x):
         return np.nan
     s = str(x).strip()
-    s = (s.replace("R$", "")
-           .replace("US$", "")
-           .replace("$", "")
-           .replace("€", "")
-           .replace(" ", ""))
+    s = (s.replace("R$", "").replace("US$", "").replace("$", "")
+           .replace("€", "").replace(" ", ""))
     s = s.replace(".", "").replace(",", ".")
-    try:
-        return float(s)
-    except Exception:
-        return np.nan
+    try: return float(s)
+    except: return np.nan
 
 def to_int_safe(x):
     try:
-        if pd.isna(x) or str(x).strip() == "":
-            return np.nan
+        if pd.isna(x) or str(x).strip() == "": return np.nan
         return int(float(str(x).replace(",", ".").strip()))
-    except Exception:
-        return np.nan
+    except: return np.nan
 
 def to_date_br(x):
-    if pd.isna(x) or str(x).strip() == "":
-        return pd.NaT
+    if pd.isna(x) or str(x).strip() == "": return pd.NaT
     s = str(x).strip()
-    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except Exception:
-            pass
-    try:
-        return pd.to_datetime(s, dayfirst=True).date()
-    except Exception:
-        return pd.NaT
+    for fmt in ("%d/%m/%Y","%Y-%m-%d","%d-%m-%Y"):
+        try: return datetime.strptime(s, fmt).date()
+        except: pass
+    try: return pd.to_datetime(s, dayfirst=True).date()
+    except: return pd.NaT
 
 def pick_col(df: pd.DataFrame, candidates):
     cols = {c.lower().strip(): c for c in df.columns}
     for cand in candidates:
         k = cand.lower().strip()
-        if k in cols:
-            return cols[k]
-    for cand in candidates:  # startswith
+        if k in cols: return cols[k]
+    for cand in candidates:
         for k, orig in cols.items():
-            if k.startswith(cand.lower().strip()):
-                return orig
+            if k.startswith(cand.lower().strip()): return orig
     return None
 
 def fmt_moeda(v):
-    try:
-        return "R$ " + f"{float(v):,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
-    except Exception:
-        return v
+    try: return "R$ " + f"{float(v):,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
+    except: return v
 
 def realinha_cabecalho(df, procurar=("ticker", "data")):
-    """Se o cabeçalho não estiver na primeira linha, encontra e realinha."""
     for i in range(min(25, len(df))):
         linha = df.iloc[i].astype(str).str.strip().str.lower().tolist()
         if any(procurar[0] in x for x in linha) and any(procurar[1] in x for x in linha):
@@ -115,95 +89,69 @@ def realinha_cabecalho(df, procurar=("ticker", "data")):
             return df2
     return df
 
-# =========================
-# CARREGAMENTO ROBUSTO
-# =========================
+# === LOAD BASE ===
 @st.cache_data(ttl=300)
 def carregar_via_service_account(sheet_id: str, alvo_nomes: list):
-    """Tenta ler via Service Account (secrets). Se não houver acesso, retorna None."""
     try:
         import gspread
         from gspread_dataframe import get_as_dataframe
         from google.oauth2.service_account import Credentials
-
         info = st.secrets.get("gcp_service_account") or st.secrets.get("GCP_SERVICE_ACCOUNT")
-        if not info:
-            return None
+        if not info: return None
         creds = Credentials.from_service_account_info(
             info,
-            scopes=[
-                "https://www.googleapis.com/auth/spreadsheets.readonly",
-                "https://www.googleapis.com/auth/drive.readonly",
-            ],
+            scopes=["https://www.googleapis.com/auth/spreadsheets.readonly",
+                    "https://www.googleapis.com/auth/drive.readonly"]
         )
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(sheet_id)
-
-        def norm(s):
-            return re.sub(r"\s+", " ", re.sub(r"[^\w]+", " ", s.lower())).strip()
-
+        def norm(s): return re.sub(r"\s+", " ", re.sub(r"[^\w]+", " ", s.lower())).strip()
         mapa = {norm(ws.title): ws for ws in sh.worksheets()}
         for nome in alvo_nomes:
             if norm(nome) in mapa:
                 ws = mapa[norm(nome)]
                 df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str)
-                df = df.dropna(how="all").dropna(axis=1, how="all")
-                return df
+                return df.dropna(how="all").dropna(axis=1, how="all")
         return None
     except Exception:
         return None
 
 @st.cache_data(ttl=300)
 def carregar_via_csv(sheet_id: str, alvo_nomes: list, gid: str | None):
-    """Tenta CSV por nome; se falhar e houver GID, tenta por GID."""
     last_err = None
     for nome in alvo_nomes:
-        try:
-            return pd.read_csv(csv_url_by_name(sheet_id, nome), dtype=str)
-        except Exception as e:
-            last_err = e
-            continue
+        try:  return pd.read_csv(csv_url_by_name(sheet_id, nome), dtype=str)
+        except Exception as e: last_err = e
     if gid:
-        try:
-            return pd.read_csv(csv_url_by_gid(sheet_id, gid), dtype=str)
-        except Exception as e:
-            last_err = e
+        try:  return pd.read_csv(csv_url_by_gid(sheet_id, gid), dtype=str)
+        except Exception as e: last_err = e
     raise last_err if last_err else RuntimeError("Falha ao carregar CSV")
 
 def carregar_tabela(sheet_id: str, alvo_nomes: list, gid: str | None):
     df = carregar_via_service_account(sheet_id, alvo_nomes)
-    if df is not None:
-        return df
-    try:
-        return carregar_via_csv(sheet_id, alvo_nomes, gid)
-    except Exception as e:
-        st.error(
-            "Não consegui ler a aba por CSV. Opções:\n"
-            "1) Deixe a planilha como 'Qualquer pessoa com o link – Leitor';\n"
-            "2) Compartilhe com o e-mail da Service Account (secrets `client_email`);\n"
-            "3) Preencha o GID da aba nas constantes GID_*.\n\n"
-            f"Erro: {type(e).__name__}: {e}"
-        )
-        raise
+    if df is not None: return df
+    return carregar_via_csv(sheet_id, alvo_nomes, gid)
 
-# =========================
-# LOAD: PROVENTOS
-# =========================
+# === LOAD PROVENTOS ===
 @st.cache_data(ttl=300)
 def load_proventos(sheet_id: str) -> pd.DataFrame:
     df = carregar_tabela(sheet_id, PROVENTOS_ALVOS, GID_PROVENTOS)
     df = realinha_cabecalho(df)
 
-    # mapear colunas
-    col_ticker    = pick_col(df, ["Ticker"])
-    col_tipo      = pick_col(df, ["Tipo Provento", "Tipo", "Provento"])
-    col_data      = pick_col(df, ["Data"])
-    col_qtd       = pick_col(df, ["Quantidade", "Qtd"])
-    col_unit      = pick_col(df, ["Unitário R$", "Unitario R$", "Unitário", "Unitario", "Valor por cota", "Valor unitário"])
-    col_irrf      = pick_col(df, ["IRRF", "Imposto", "Impostos"])
-    col_mes       = pick_col(df, ["Mês", "Mes"])
-    col_ano       = pick_col(df, ["Ano"])
-    col_classe    = pick_col(df, ["Classe do Ativo", "Classe", "Classe do ativo"])
+    # guarda coluna original de total, se existir (para auditoria)
+    orig_tot_col = pick_col(df, ["Total Líquido R$", "Total Liquido R$", "Total Líquido", "Total Liquido"])
+    orig_tot_series = df[orig_tot_col].copy() if orig_tot_col else None
+
+    # mapear e renomear
+    col_ticker = pick_col(df, ["Ticker"])
+    col_tipo   = pick_col(df, ["Tipo Provento","Tipo","Provento"])
+    col_data   = pick_col(df, ["Data"])
+    col_qtd    = pick_col(df, ["Quantidade","Qtd"])
+    col_unit   = pick_col(df, ["Unitário R$","Unitario R$","Unitário","Unitario","Valor por cota","Valor unitário"])
+    col_irrf   = pick_col(df, ["IRRF","Imposto","Impostos"])
+    col_mes    = pick_col(df, ["Mês","Mes"])
+    col_ano    = pick_col(df, ["Ano"])
+    col_class  = pick_col(df, ["Classe do Ativo","Classe","Classe do ativo"])
 
     rename = {}
     if col_ticker: rename[col_ticker] = "Ticker"
@@ -214,71 +162,65 @@ def load_proventos(sheet_id: str) -> pd.DataFrame:
     if col_irrf:   rename[col_irrf]   = "IRRF"
     if col_mes:    rename[col_mes]    = "Mes"
     if col_ano:    rename[col_ano]    = "Ano"
-    if col_classe: rename[col_classe] = "Classe"
+    if col_class:  rename[col_class]  = "Classe"
     df = df.rename(columns=rename)
 
-    # garantir colunas
-    required = ["Ticker","Tipo","Data","Quantidade","Unitario_R$","IRRF","Mes","Ano","Classe"]
-    for c in required:
-        if c not in df.columns:
-            df[c] = np.nan
+    for c in ["Ticker","Tipo","Data","Quantidade","Unitario_R$","IRRF","Mes","Ano","Classe"]:
+        if c not in df.columns: df[c] = np.nan
 
-    # limpeza
-    df["Data"] = df["Data"].map(to_date_br)
-    df["Quantidade"] = df["Quantidade"].map(to_int_safe)
-    for c in ["Unitario_R$", "IRRF"]:
-        df[c] = df[c].map(to_float_br)
+    # conversões
+    df["Data"]        = df["Data"].map(to_date_br)
+    df["Quantidade"]  = df["Quantidade"].map(to_int_safe)
+    df["Unitario_R$"] = df["Unitario_R$"].map(to_float_br)
+    df["IRRF"]        = df["IRRF"].map(to_float_br)
 
-    # completar Ano/Mês com Series alinhadas
     if df["Data"].notna().any():
         ano_series = df["Data"].apply(lambda d: d.year if pd.notna(d) else np.nan)
         mes_series = df["Data"].apply(lambda d: MESES_PT.get(d.month) if pd.notna(d) else np.nan)
         df["Ano"] = pd.to_numeric(df["Ano"], errors="coerce").fillna(ano_series)
         df["Mes"] = df["Mes"].fillna(mes_series)
 
-    # === CÁLCULO CORRETO DO TOTAL ===
-    df["Quantidade"]  = df["Quantidade"].fillna(0)
-    df["Unitario_R$"] = df["Unitario_R$"].fillna(0)
-    df["IRRF"]        = df["IRRF"].fillna(0)
+    # CÁLCULO CORRETO (sempre)
+    df[["Quantidade","Unitario_R$","IRRF"]] = df[["Quantidade","Unitario_R$","IRRF"]].fillna(0)
     df["Total_Liquido_R$"] = df["Quantidade"] * df["Unitario_R$"] - df["IRRF"]
     df["Total_Liquido_R$"] = df["Total_Liquido_R$"].clip(lower=0)
 
-    # finais
+    # guarda total original, se existir
+    if orig_tot_series is not None:
+        df["Total_Liquido_Orig_R$"] = pd.to_numeric(orig_tot_series.map(to_float_br), errors="coerce")
+    else:
+        df["Total_Liquido_Orig_R$"] = np.nan
+
     df = df[df["Ticker"].astype(str).str.strip() != ""].copy()
     df["Classe"] = df["Classe"].fillna("")
     return df
 
-# =========================
-# LOAD: MEUS ATIVOS
-# =========================
+# === LOAD MEUS ATIVOS ===
 @st.cache_data(ttl=300)
 def load_meus_ativos(sheet_id: str) -> pd.DataFrame:
     df = carregar_tabela(sheet_id, MEUS_ATIVOS_ALVOS, GID_MEUS_ATIVOS)
     df = realinha_cabecalho(df)
 
-    col_ticker   = pick_col(df, ["Ticker"])
-    col_pct      = pick_col(df, ["% na Carteira", "% na carteira"])
-    col_pos      = pick_col(df, ["Posição", "Posicao"])
-    col_classe   = pick_col(df, ["Classe"])
-    col_qtd      = pick_col(df, ["Quantidade (Líquida)", "Quantidade", "Qtd"])
-    col_pm_adj   = pick_col(df, ["Preço Médio Ajustado (R$)", "Preço Médio Ajustado", "PM Ajustado"])
-    col_cot      = pick_col(df, ["Cotação de Hoje (R$)", "Cotação de Hoje", "Cotacao de Hoje"])
+    col_ticker = pick_col(df, ["Ticker"])
+    col_pct    = pick_col(df, ["% na Carteira","% na carteira"])
+    col_pos    = pick_col(df, ["Posição","Posicao"])
+    col_class  = pick_col(df, ["Classe"])
+    col_qtd    = pick_col(df, ["Quantidade (Líquida)","Quantidade","Qtd"])
+    col_pm     = pick_col(df, ["Preço Médio Ajustado (R$)","Preço Médio Ajustado","PM Ajustado"])
+    col_cot    = pick_col(df, ["Cotação de Hoje (R$)","Cotação de Hoje","Cotacao de Hoje"])
 
     rename = {}
     if col_ticker: rename[col_ticker] = "Ticker"
     if col_pct:    rename[col_pct]    = "Pct_Carteira"
     if col_pos:    rename[col_pos]    = "Posicao"
-    if col_classe: rename[col_classe] = "Classe"
+    if col_class:  rename[col_class]  = "Classe"
     if col_qtd:    rename[col_qtd]    = "Qtd_Liquida"
-    if col_pm_adj: rename[col_pm_adj] = "PM_Ajustado_R$"
+    if col_pm:     rename[col_pm]     = "PM_Ajustado_R$"
     if col_cot:    rename[col_cot]    = "Cotacao_R$"
     df = df.rename(columns=rename)
 
-    # conversões
     if "Pct_Carteira" in df.columns:
-        df["Pct_Carteira"] = (
-            df["Pct_Carteira"].astype(str).str.replace("%", "", regex=False).map(to_float_br) / 100.0
-        )
+        df["Pct_Carteira"] = (df["Pct_Carteira"].astype(str).str.replace("%","",regex=False).map(to_float_br) / 100.0)
     if "Qtd_Liquida" in df.columns:
         df["Qtd_Liquida"] = df["Qtd_Liquida"].map(to_int_safe)
     if "PM_Ajustado_R$" in df.columns:
@@ -286,7 +228,6 @@ def load_meus_ativos(sheet_id: str) -> pd.DataFrame:
     if "Cotacao_R$" in df.columns:
         df["Cotacao_R$"] = df["Cotacao_R$"].map(to_float_br)
 
-    # ===== Posição e % na carteira robustas =====
     qtd = df.get("Qtd_Liquida", pd.Series(0)).fillna(0)
     cot = df.get("Cotacao_R$",   pd.Series(0)).fillna(0)
     pm  = df.get("PM_Ajustado_R$", pd.Series(0)).fillna(0)
@@ -295,42 +236,35 @@ def load_meus_ativos(sheet_id: str) -> pd.DataFrame:
     if "Posicao" not in df.columns or df["Posicao"].isna().all():
         df["Posicao"] = np.where(qtd > 0, "Ativa", "Encerrada")
 
-    # base para %: usa valor atual; se zerado, usa investido
+    # % carteira
     valor_atual     = (cot * qtd)
     valor_investido = (pm  * qtd)
     base = valor_atual.where(valor_atual > 0, valor_investido)
     total_base = base.sum()
     df["Pct_Carteira"] = np.where(total_base > 0, base / total_base, 0.0)
 
-    if "Classe" not in df.columns:
-        df["Classe"] = ""
-
+    if "Classe" not in df.columns: df["Classe"] = ""
     return df
 
-# =========================
-# DADOS
-# =========================
+# === DADOS ===
 prov = load_proventos(SHEET_ID)
 ativos = load_meus_ativos(SHEET_ID)
 
-# Debug opcional
 if st.sidebar.checkbox("🔧 Mostrar colunas detectadas (debug)"):
     st.write("Proventos:", sorted(prov.columns.tolist()))
     st.write("Meus Ativos:", sorted(ativos.columns.tolist()))
 
-# Coluna segura de ano
+# ano seguro
 prov["Ano_num"] = pd.to_numeric(prov.get("Ano"), errors="coerce")
 if prov["Ano_num"].isna().all() and "Data" in prov.columns:
     prov["Ano_num"] = prov["Data"].apply(lambda d: d.year if pd.notna(d) else np.nan)
 
 anos_disponiveis = sorted([int(a) for a in prov["Ano_num"].dropna().unique()])
 if not anos_disponiveis:
-    st.error("Não encontrei anos válidos em 'Proventos'. Verifique se há 'Data' preenchida.")
+    st.error("Não encontrei anos válidos em 'Proventos'. Verifique se a coluna 'Data' está preenchida.")
     st.stop()
 
-# =========================
-# FILTROS
-# =========================
+# === FILTROS ===
 ano_sel = st.sidebar.selectbox("Ano", anos_disponiveis[::-1])
 classes = ["(todas)"] + sorted([c for c in prov["Classe"].dropna().unique() if str(c).strip() != ""])
 classe_sel = st.sidebar.selectbox("Classe", classes, index=0)
@@ -343,7 +277,7 @@ df = prov[prov["Ano_num"] == int(ano_sel)].copy()
 if classe_sel != "(todas)":
     df = df[df["Classe"] == classe_sel]
 if pos_sel != "(todas)":
-    df = df.merge(ativos[["Ticker", "Posicao"]], on="Ticker", how="left")
+    df = df.merge(ativos[["Ticker","Posicao"]], on="Ticker", how="left")
     df = df[df["Posicao"].fillna("(desconhecida)") == pos_sel]
 if ticker_sel != "(todos)":
     df = df[df["Ticker"] == ticker_sel]
@@ -352,20 +286,24 @@ if df.empty:
     st.warning("Sem registros para os filtros escolhidos.")
     st.stop()
 
-# 🔎 Diagnóstico rápido (top 10 por valor)
-with st.expander("🔎 Diagnóstico (top 10 por valor do mês/ano)"):
+# === AUDITORIA (conferência rápida) ===
+with st.expander("🔎 Auditoria — linhas com maior valor (cálculo vs. planilha)", expanded=False):
+    colA, colB, colC = st.columns(3)
+    colA.metric("Soma calculada (Qtd×Unit−IRRF)", fmt_moeda(df["Total_Liquido_R$"].sum()))
+    colB.metric("Soma original (se havia coluna)", fmt_moeda(df["Total_Liquido_Orig_R$"].sum()))
+    colC.metric("Nº de lançamentos", len(df))
+    audit = df.assign(Diff=(df["Total_Liquido_R$"] - df["Total_Liquido_Orig_R$"]))
     st.dataframe(
-        df.sort_values("Total_Liquido_R$", ascending=False)[
-            ["Ticker","Data","Quantidade","Unitario_R$","IRRF","Total_Liquido_R$"]
-        ].head(10),
+        audit.sort_values("Total_Liquido_R$", ascending=False)[
+            ["Ticker","Data","Tipo","Quantidade","Unitario_R$","IRRF",
+             "Total_Liquido_R$","Total_Liquido_Orig_R$","Diff"]
+        ].head(25),
         use_container_width=True
     )
 
-# =========================
-# CALENDÁRIO (pivot Jan–Dez)
-# =========================
+# === CALENDÁRIO ===
 df["Mes"] = pd.Categorical(df["Mes"], categories=COL_ORDEM_MESES, ordered=True)
-g_mes_ticker = df.groupby(["Ticker", "Mes"], dropna=False)["Total_Liquido_R$"].sum().reset_index()
+g_mes_ticker = df.groupby(["Ticker","Mes"], dropna=False)["Total_Liquido_R$"].sum().reset_index()
 
 pivot = g_mes_ticker.pivot(index="Ticker", columns="Mes", values="Total_Liquido_R$").fillna(0.0)
 pivot = pivot.reindex(columns=COL_ORDEM_MESES, fill_value=0.0)
@@ -376,63 +314,37 @@ media_mensal = total_ano / 12.0
 melhor_mes_idx = pivot.drop(columns=["Total no ano"]).sum().idxmax()
 melhor_mes_val = pivot.drop(columns=["Total no ano"]).sum().max()
 
-# Metadados (sem KeyError)
-meta_cols = ["Ticker", "Classe", "Pct_Carteira", "Posicao"]
-if "Classe" not in ativos.columns:
-    ativos["Classe"] = ""
-if "Posicao" not in ativos.columns:
-    ativos["Posicao"] = np.where(ativos.get("Qtd_Liquida", pd.Series(0)).fillna(0) > 0, "Ativa", "Encerrada")
-if "Pct_Carteira" not in ativos.columns:
-    ativos["Pct_Carteira"] = 0.0
-
+# Metadados
+meta_cols = ["Ticker","Classe","Pct_Carteira","Posicao"]
+for c in ["Classe","Posicao","Pct_Carteira"]:
+    if c not in ativos.columns:
+        ativos[c] = "" if c!="Pct_Carteira" else 0.0
 meta = ativos[meta_cols].copy()
 meta["Pct_Carteira"] = meta["Pct_Carteira"].fillna(0.0)
 
 tabela = meta.merge(pivot.reset_index(), on="Ticker", how="right").fillna(0.0)
 
-# =========================
-# YIELDS (DY 12m, YOC, Yield do mês)
-# =========================
-dez31 = datetime(int(ano_sel), 12, 31).date()
-ini12 = (datetime(int(ano_sel), 12, 31) - timedelta(days=365)).date()
-prov_12m = prov[(prov["Data"].notna()) & (prov["Data"] > ini12) & (prov["Data"] <= dez31)]
-agg_12m = (
-    prov_12m.groupby("Ticker")["Total_Liquido_R$"]
-    .sum()
-    .reset_index()
-    .rename(columns={"Total_Liquido_R$": "Prov_12m_R$"})
-)
+# === YIELDS (12m / YOC / yield mês) ===
+dez31 = datetime(int(ano_sel),12,31).date()
+ini12 = (datetime(int(ano_sel),12,31) - timedelta(days=365)).date()
+prov_12m = prov[(prov["Data"].notna()) & (prov["Data"]>ini12) & (prov["Data"]<=dez31)]
+agg_12m = prov_12m.groupby("Ticker")["Total_Liquido_R$"].sum().reset_index().rename(columns={"Total_Liquido_R$":"Prov_12m_R$"})
 
-ult_unit = (
-    df.sort_values("Data")
-      .dropna(subset=["Unitario_R$"])
-      .groupby("Ticker")["Unitario_R$"]
-      .last()
-      .reset_index()
-      .rename(columns={"Unitario_R$": "Ultimo_Unitario_R$"})
-)
+ult_unit = (df.sort_values("Data").dropna(subset=["Unitario_R$"])
+              .groupby("Ticker")["Unitario_R$"].last().reset_index()
+              .rename(columns={"Unitario_R$":"Ultimo_Unitario_R$"}))
 
-yields = ativos[["Ticker", "Qtd_Liquida", "PM_Ajustado_R$", "Cotacao_R$"]].copy()
+yields = ativos[["Ticker","Qtd_Liquida","PM_Ajustado_R$","Cotacao_R$"]].copy()
 yields = yields.merge(agg_12m, on="Ticker", how="left").merge(ult_unit, on="Ticker", how="left")
 yields["Valor_Atual_R$"] = yields["Cotacao_R$"] * yields["Qtd_Liquida"]
-yields["DY_12m"] = np.where(
-    yields["Valor_Atual_R$"] > 0, yields["Prov_12m_R$"] / yields["Valor_Atual_R$"], np.nan
-)
-yields["YOC"] = np.where(
-    yields["PM_Ajustado_R$"] > 0, yields["Ultimo_Unitario_R$"] / yields["PM_Ajustado_R$"], np.nan
-)
+yields["DY_12m"] = np.where(yields["Valor_Atual_R$"]>0, yields["Prov_12m_R$"]/yields["Valor_Atual_R$"], np.nan)
+yields["YOC"]    = np.where(yields["PM_Ajustado_R$"]>0, yields["Ultimo_Unitario_R$"]/yields["PM_Ajustado_R$"], np.nan)
 yields["Yield_mensal"] = yields["YOC"]
 
-tabela = tabela.merge(
-    yields[["Ticker", "DY_12m", "YOC", "Yield_mensal"]],
-    on="Ticker",
-    how="left",
-)
+tabela = tabela.merge(yields[["Ticker","DY_12m","YOC","Yield_mensal"]], on="Ticker", how="left")
 
-# =========================
-# UI
-# =========================
-c1, c2, c3 = st.columns(3)
+# === UI ===
+c1,c2,c3 = st.columns(3)
 c1.metric("Total no ano", fmt_moeda(total_ano))
 c2.metric("Média mensal (12 meses)", fmt_moeda(media_mensal))
 c3.metric(f"Melhor mês ({melhor_mes_idx})", fmt_moeda(melhor_mes_val))
@@ -442,41 +354,40 @@ tabela_view = tabela.copy()
 for col in COL_ORDEM_MESES + ["Total no ano"]:
     if col in tabela_view.columns:
         tabela_view[col] = tabela_view[col].map(fmt_moeda)
-for col in ["Pct_Carteira", "DY_12m", "YOC", "Yield_mensal"]:
+for col in ["Pct_Carteira","DY_12m","YOC","Yield_mensal"]:
     if col in tabela_view.columns:
         tabela_view[col] = tabela_view[col].apply(lambda x: "-" if pd.isna(x) else f"{100*float(x):.2f}%")
-
 st.dataframe(tabela_view, use_container_width=True, hide_index=True)
 
 st.markdown("### Ranking de Proventos no Ano")
 ranking = pivot["Total no ano"].sort_values(ascending=False).reset_index()
-ranking.columns = ["Ticker", "Total no ano (R$)"]
+ranking.columns = ["Ticker","Total no ano (R$)"]
 ranking["Total no ano (R$)"] = ranking["Total no ano (R$)"].map(fmt_moeda)
 st.dataframe(ranking, use_container_width=True, hide_index=True)
 
-# =========================
-# Exportações
-# =========================
-def to_excel_bytes(df: pd.DataFrame) -> bytes:
-    out = BytesIO()
-    with pd.ExcelWriter(out, engine="xlsxwriter") as w:
-        df.to_excel(w, index=False, sheet_name="Calendario")
-    return out.getvalue()
+# === DOWNLOADS (fallback: openpyxl -> CSV) ===
+def to_excel_or_csv_bytes(df: pd.DataFrame):
+    try:
+        out = BytesIO()
+        with pd.ExcelWriter(out, engine="openpyxl") as w:
+            df.to_excel(w, index=False, sheet_name="Calendario")
+        return out.getvalue(), "xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    except Exception:
+        return df.to_csv(index=False).encode("utf-8"), "csv", "text/csv"
 
-col_b1, col_b2 = st.columns(2)
-with col_b1:
-    st.download_button(
-        "⬇️ Baixar Calendário (Excel)",
-        data=to_excel_bytes(tabela),
-        file_name=f"calendario_proventos_{ano_sel}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-with col_b2:
-    st.download_button(
-        "⬇️ Baixar Ranking (CSV)",
-        data=ranking.to_csv(index=False).encode("utf-8"),
-        file_name=f"ranking_proventos_{ano_sel}.csv",
-        mime="text/csv",
-    )
+data_bytes, ext, mime = to_excel_or_csv_bytes(tabela)
+st.download_button(
+    f"⬇️ Baixar Calendário ({ext.upper()})",
+    data=data_bytes,
+    file_name=f"calendario_proventos_{ano_sel}.{ext}",
+    mime=mime,
+)
 
-st.caption("Fonte: **APP_Proventos** e **APP_MeusAtivos**. Total calculado por Qtd × Unitário − IRRF; % na carteira recalculada pelo app.")
+st.download_button(
+    "⬇️ Baixar Ranking (CSV)",
+    data=ranking.to_csv(index=False).encode("utf-8"),
+    file_name=f"ranking_proventos_{ano_sel}.csv",
+    mime="text/csv",
+)
+
+st.caption("Fonte: **APP_Proventos** e **APP_MeusAtivos**. Total calculado por Qtd × Unitário − IRRF; auditoria mostra a coluna original da planilha (se existir).")
