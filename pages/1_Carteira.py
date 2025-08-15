@@ -1,39 +1,29 @@
 # pages/1_Carteira.py
 # Painel de Investimentos — Linkado ao Google Sheets
-# - Leitura robusta por GID (export?format=csv) ou por nome (gviz)
-# - Padronização de proventos SEM construir DataFrame com escalares
-# - Conversão pt-BR -> float, datas, tickers
-# - Diagnóstico das colunas lidas para facilitar debug
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import re
 import urllib.parse
-from datetime import datetime
 
 st.set_page_config(page_title="Painel de Investimentos – Linkado ao Google Sheets",
                    page_icon="📈", layout="wide")
-
 st.title("📈 Painel de Investimentos – Linkado ao Google Sheets")
 
 # =============================================================================
 # CONFIG
 # =============================================================================
-# ID da sua planilha (o que vai entre /d/ e /edit)
 SHEET_ID = "1p9IzDr-5ZV0phUHfNA_9d5xNvZW1IRo84LA__JyiiQc"
 
-# GIDs reais das suas abas:
+# Use as **chaves exatamente iguais aos nomes das abas**
 GIDS = {
-    "Carteira": "441194831",     # Aba "1. Meus Ativos"
-    "Proventos": "2109089485",   # Aba "3. Proventos"
+    "1. Meus Ativos": "441194831",
+    "3. Proventos": "2109089485",
 }
 
-# Nomes exatos das abas (também usados como fallback por nome)
-ABAS_CARTEIRA = ["1. Meus Ativos"]
+ABAS_CARTEIRA  = ["1. Meus Ativos"]
 ABAS_PROVENTOS = ["3. Proventos"]
-
-PLOTLY_TEMPLATE = "plotly_dark"
 
 # =============================================================================
 # HELPERS: leitura Google Sheets
@@ -49,48 +39,38 @@ def _csv_url_by_name(sheet_id: str, sheet_name: str) -> str:
 
 @st.cache_data(ttl=300)
 def ler_aba(sheet_id: str, candidatos: list[str], gids: dict[str, str], dtype=str) -> pd.DataFrame:
-    # 1) tenta por GID (prioritário e mais robusto)
+    # 1) tenta por GID usando a **mesma chave do nome da aba**
     for nome in candidatos:
-        # mapeia "Carteira" ou "Proventos" para seus GIDs
-        chave_gid = "Carteira" if "Meus Ativos" in nome else ("Proventos" if "Proventos" in nome else None)
-        if chave_gid and chave_gid in gids:
-            url = _csv_url_by_gid(sheet_id, gids[chave_gid])
+        if nome in gids:
             try:
-                df = pd.read_csv(url, dtype=dtype)
+                df = pd.read_csv(_csv_url_by_gid(sheet_id, gids[nome]), dtype=dtype)
                 if not df.empty:
                     df.columns = [c.strip() for c in df.columns]
                     return df
             except Exception:
                 pass
-
     # 2) fallback por NOME (gviz)
     for nome in candidatos:
-        url = _csv_url_by_name(sheet_id, nome)
         try:
-            df = pd.read_csv(url, dtype=dtype)
+            df = pd.read_csv(_csv_url_by_name(sheet_id, nome), dtype=dtype)
             if not df.empty:
                 df.columns = [c.strip() for c in df.columns]
                 return df
         except Exception:
             pass
-
-    # 3) falhou: retorna DF vazio
     return pd.DataFrame()
 
 # =============================================================================
 # HELPERS: parsing/normalização
 # =============================================================================
 def parse_brl_number(x):
-    """
-    Converte 'R$ 1.234,56', '3,21%', '1.234,56', '1234,56', '  ' -> float ou <NA>.
-    """
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return pd.NA
     s = str(x).strip()
     if s == "" or s.lower() in {"nan", "none"}:
         return pd.NA
-    s = re.sub(r"[R$\s%]", "", s)  # remove R$, espaços e %
-    s = s.replace(".", "").replace(",", ".")  # pt-BR -> en-US
+    s = re.sub(r"[R$\s%]", "", s)
+    s = s.replace(".", "").replace(",", ".")
     try:
         return float(s)
     except Exception:
@@ -109,13 +89,9 @@ def parse_date(x):
         return pd.NaT
 
 # =============================================================================
-# Padronização de Proventos (CORRIGIDA)
+# Padronização de Proventos
 # =============================================================================
 def padronizar_proventos(df_pv_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Padroniza as colunas de proventos vindas da planilha para um DF consistente.
-    Nunca cria DataFrame com escalares (usa mesmo índice da origem).
-    """
     if df_pv_raw is None or df_pv_raw.empty:
         return pd.DataFrame(columns=[
             "data", "ticker", "tipo", "quantidade", "valor",
@@ -137,36 +113,23 @@ def padronizar_proventos(df_pv_raw: pd.DataFrame) -> pd.DataFrame:
 
     for destino, candidatos in mapa.items():
         col_origem = next((c for c in candidatos if c in df_pv_raw.columns), None)
-        if col_origem is not None:
-            out[destino] = df_pv_raw[col_origem]
-        else:
-            out[destino] = pd.NA  # vetor <NA> do mesmo tamanho, evitando escalares
+        out[destino] = df_pv_raw[col_origem] if col_origem else pd.NA
 
-    # Normalizações
     out["data"] = out["data"].apply(parse_date)
     for c in ["valor", "corretagem", "impostos"]:
         out[c] = out[c].apply(parse_brl_number).astype("Float64")
     out["quantidade"] = out["quantidade"].apply(parse_int).astype("Int64")
 
     if "ticker" in out.columns:
-        out["ticker"] = (
-            out["ticker"]
-            .astype("string")
-            .str.upper()
-            .str.strip()
-            .str.replace(" ", "", regex=False)
-        )
-
+        out["ticker"] = (out["ticker"].astype("string")
+                         .str.upper().str.strip().str.replace(" ", "", regex=False))
     for c in ["tipo", "instituicao"]:
         out[c] = out[c].astype("string")
 
     col_ordem = ["data", "ticker", "tipo", "quantidade", "valor",
                  "corretagem", "impostos", "instituicao"]
     out = out[col_ordem]
-
-    # remove linhas totalmente vazias (sem data e sem valor)
     out = out[~(out["data"].isna() & out["valor"].isna())].reset_index(drop=True)
-
     return out
 
 # =============================================================================
@@ -192,15 +155,12 @@ def padronizar_carteira(df_raw: pd.DataFrame) -> pd.DataFrame:
         col = next((c for c in candidatos if c in df_raw.columns), None)
         out[destino] = df_raw[col] if col else pd.NA
 
-    # normalizações
-    out["ticker"] = (
-        out["ticker"].astype("string").str.upper().str.strip().str.replace(" ", "", regex=False)
-    )
+    out["ticker"] = (out["ticker"].astype("string")
+                     .str.upper().str.strip().str.replace(" ", "", regex=False))
     for c in ["pm", "preco_atual", "valor_posicao"]:
         out[c] = out[c].apply(parse_brl_number).astype("Float64")
     out["qtde"] = out["qtde"].apply(parse_int).astype("Int64")
 
-    # remove linhas sem ticker
     out = out[~out["ticker"].isna()].reset_index(drop=True)
     return out
 
@@ -211,14 +171,14 @@ with st.spinner("Carregando dados da planilha..."):
     df_cart_raw = ler_aba(SHEET_ID, ABAS_CARTEIRA, GIDS, dtype=str)
     df_pv_raw   = ler_aba(SHEET_ID, ABAS_PROVENTOS, GIDS, dtype=str)
 
-# Diagnóstico das abas
+# Diagnóstico
 with st.expander("🔎 Diagnóstico das abas (colunas lidas)", expanded=False):
     st.write("**Carteira (raw):**", df_cart_raw.shape)
     if not df_cart_raw.empty:
         st.write(list(df_cart_raw.columns))
         st.dataframe(df_cart_raw.head(10), use_container_width=True)
     else:
-        st.warning("Aba de **Carteira** não encontrada por GID nem por nome (verifique `GIDS` e nomes candidatos).")
+        st.warning("Aba de **Carteira** não encontrada por GID nem por nome.")
 
     st.write("---")
     st.write("**Proventos (raw):**", df_pv_raw.shape)
@@ -226,14 +186,14 @@ with st.expander("🔎 Diagnóstico das abas (colunas lidas)", expanded=False):
         st.write(list(df_pv_raw.columns))
         st.dataframe(df_pv_raw.head(10), use_container_width=True)
     else:
-        st.warning("Aba de **Proventos** não encontrada por GID nem por nome (verifique `GIDS` e nomes candidatos).")
+        st.warning("Aba de **Proventos** não encontrada por GID nem por nome.")
 
-# Padronizações (inclui a correção que evita o ValueError)
-CARTEIRA = padronizar_carteira(df_cart_raw)
+# Padronização
+CARTEIRA  = padronizar_carteira(df_cart_raw)
 PROVENTOS = padronizar_proventos(df_pv_raw)
 
 # =============================================================================
-# UI / Resultados básicos
+# UI / Resultados
 # =============================================================================
 col1, col2 = st.columns(2)
 
