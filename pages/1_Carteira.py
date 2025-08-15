@@ -1,226 +1,343 @@
-# pages/1_Carteira.py
+# app_investimentos.py
+# -----------------------------------------------------------------
 # Painel de Investimentos — Linkado ao Google Sheets
+# - Detecta abas por NOME (sem depender de GID)
+# - Alvos: "2. Lançamentos (B3)" (carteira) e "3. Proventos"
+# - Faz normalização de acentos/maiúsculas/nomes de colunas
+# - Padroniza colunas principais para análise
+# - Mostra diagnóstico e prévias
+# -----------------------------------------------------------------
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import re
-import urllib.parse
+import re, unicodedata
+from urllib.parse import quote
 
-st.set_page_config(page_title="Painel de Investimentos – Linkado ao Google Sheets",
-                   page_icon="📈", layout="wide")
+# =========================
+# CONFIG PRINCIPAL
+# =========================
+st.set_page_config(page_title="Painel de Investimentos", page_icon="📈", layout="wide")
 st.title("📈 Painel de Investimentos – Linkado ao Google Sheets")
 
-# =============================================================================
-# CONFIG
-# =============================================================================
-SHEET_ID = "1p9IzDr-5ZV0phUHfNA_9d5xNvZW1IRo84LA__JyiiQc"
+# >>>>>>>> EDITE APENAS ISTO <<<<<<<<
+SHEET_ID = "1p9IzDr-5ZV0phUHfNA_9d5xNvZW1IRo84LA__JyiiQc"  # <-- coloque aqui o ID da SUA planilha
+# (opcional) para testes locais com Excel, passe excel_path no carregar_dados_investimentos(...)
+EXCEL_LOCAL = None  # ex: r"/caminho/_PLANILHA - v4.5 (8).xlsx"
 
-# Use as **chaves exatamente iguais aos nomes das abas**
-GIDS = {
-    "1. Meus Ativos": "441194831",
-    "3. Proventos": "2109089485",
-}
+ALVOS_CARTEIRA = ["2. Lançamentos (B3)", "2.1. Lançamentos (Manual)"]
+ALVOS_PROVENTOS = ["3. Proventos"]
 
-ABAS_CARTEIRA  = ["1. Meus Ativos"]
-ABAS_PROVENTOS = ["3. Proventos"]
+# =========================
+# FUNÇÕES UTILITÁRIAS
+# =========================
+def _norm(s: str) -> str:
+    """Normaliza acento/caixa/espaços para comparar strings."""
+    if s is None: 
+        return ""
+    s = unicodedata.normalize("NFKD", str(s))
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
 
-# =============================================================================
-# HELPERS: leitura Google Sheets
-# =============================================================================
-@st.cache_data(ttl=300)
-def _csv_url_by_gid(sheet_id: str, gid: str) -> str:
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+def escolher_aba_existente(lista_abas, candidatos):
+    """Escolhe o primeiro candidato que existir na lista de abas (comparação normalizada)."""
+    norm_map = { _norm(a): a for a in lista_abas }
+    for cand in candidatos:
+        n = _norm(cand)
+        if n in norm_map:
+            return norm_map[n]
+    return None
 
-@st.cache_data(ttl=300)
-def _csv_url_by_name(sheet_id: str, sheet_name: str) -> str:
-    encoded = urllib.parse.quote(sheet_name, safe="")
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={encoded}"
+def ler_gsheet_por_nome(sheet_id: str, sheet_name: str) -> pd.DataFrame:
+    """
+    Lê Google Sheets por NOME da aba usando endpoint CSV (gviz).
+    Evita depender de GID e funciona com nomes com espaços/acentos (via URL-encode).
+    """
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={quote(sheet_name)}"
+    df = pd.read_csv(url, dtype=str)
+    return df
 
-@st.cache_data(ttl=300)
-def ler_aba(sheet_id: str, candidatos: list[str], gids: dict[str, str], dtype=str) -> pd.DataFrame:
-    # 1) tenta por GID usando a **mesma chave do nome da aba**
-    for nome in candidatos:
-        if nome in gids:
-            try:
-                df = pd.read_csv(_csv_url_by_gid(sheet_id, gids[nome]), dtype=dtype)
-                if not df.empty:
-                    df.columns = [c.strip() for c in df.columns]
-                    return df
-            except Exception:
-                pass
-    # 2) fallback por NOME (gviz)
-    for nome in candidatos:
-        try:
-            df = pd.read_csv(_csv_url_by_name(sheet_id, nome), dtype=dtype)
-            if not df.empty:
-                df.columns = [c.strip() for c in df.columns]
-                return df
-        except Exception:
-            pass
-    return pd.DataFrame()
-
-# =============================================================================
-# HELPERS: parsing/normalização
-# =============================================================================
-def parse_brl_number(x):
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return pd.NA
+def limpar_numero_ptbr(x):
+    """
+    Converte strings 'R$ 1.234,56' / '1.234,56' / '3,1%' / '-1.234' em float.
+    Se não der, retorna NaN.
+    """
+    if pd.isna(x):
+        return np.nan
     s = str(x).strip()
-    if s == "" or s.lower() in {"nan", "none"}:
-        return pd.NA
-    s = re.sub(r"[R$\s%]", "", s)
+    if s == "":
+        return np.nan
+    s = s.replace("R$", "").replace("%", "").replace(" ", "")
+    # separador milhar '.' e decimal ','
     s = s.replace(".", "").replace(",", ".")
     try:
         return float(s)
-    except Exception:
-        return pd.NA
+    except:
+        return np.nan
 
-def parse_int(x):
+def to_datetime_br(s):
+    if pd.isna(s): 
+        return pd.NaT
+    s = str(s).strip()
+    # pandas infere DD/MM/YYYY automaticamente quando dayfirst=True
     try:
-        return int(float(str(x).replace(",", ".").strip()))
-    except Exception:
-        return pd.NA
-
-def parse_date(x):
-    try:
-        return pd.to_datetime(x, dayfirst=True, errors="coerce")
-    except Exception:
+        return pd.to_datetime(s, dayfirst=True, errors="coerce")
+    except:
         return pd.NaT
 
-# =============================================================================
-# Padronização de Proventos
-# =============================================================================
-def padronizar_proventos(df_pv_raw: pd.DataFrame) -> pd.DataFrame:
-    if df_pv_raw is None or df_pv_raw.empty:
-        return pd.DataFrame(columns=[
-            "data", "ticker", "tipo", "quantidade", "valor",
-            "corretagem", "impostos", "instituicao"
-        ])
+def renomear_primeiro_match(df: pd.DataFrame, possiveis, novo_nome):
+    """
+    Procura, dentre 'possiveis' (lista de nomes alternativos), 
+    qual coluna existe no DF e renomeia para 'novo_nome'.
+    """
+    colmap = {}
+    cols_norm = { _norm(c): c for c in df.columns }
+    for alt in possiveis:
+        n = _norm(alt)
+        if n in cols_norm:
+            colmap[cols_norm[n]] = novo_nome
+            break
+    if colmap:
+        df = df.rename(columns=colmap)
+    return df
 
-    mapa = {
-        "data": ["Data", "data", "Data do Crédito", "Data Crédito", "Data Credito"],
-        "ticker": ["Ticker", "Ativo", "Código", "Código de Negociação", "Codigo"],
-        "tipo": ["Tipo", "Tipo de Provento", "Evento", "Tipo Provento"],
-        "quantidade": ["Qtd", "Quantidade", "QTD"],
-        "valor": ["Total Líquido R$", "Valor Líquido", "Valor", "Total Líquido", "Provento Líquido", "Total"],
-        "instituicao": ["Instituição", "Corretora", "Conta"],
-        "corretagem": ["Corretagem", "Taxa de Corretagem"],
-        "impostos": ["Impostos", "IR", "Taxas/Impostos", "IRRF"],
-    }
+# =========================
+# CARREGAMENTO DE DADOS
+# =========================
+@st.cache_data(ttl=300)
+def descobrir_abas(sheet_id=None, excel_path=None):
+    if excel_path:
+        xls = pd.ExcelFile(excel_path)
+        abas = xls.sheet_names
+    else:
+        # Para Sheets, se não listarmos, tentaremos diretamente pelos candidatos.
+        # Ainda assim, retornamos os candidatos para a função leitora tentar um por um.
+        abas = ALVOS_CARTEIRA + ALVOS_PROVENTOS
 
-    out = pd.DataFrame(index=df_pv_raw.index)
+    nome_carteira = escolher_aba_existente(abas, ALVOS_CARTEIRA) or ALVOS_CARTEIRA[0]
+    nome_proventos = escolher_aba_existente(abas, ALVOS_PROVENTOS) or ALVOS_PROVENTOS[0]
+    return nome_carteira, nome_proventos, abas
 
-    for destino, candidatos in mapa.items():
-        col_origem = next((c for c in candidatos if c in df_pv_raw.columns), None)
-        out[destino] = df_pv_raw[col_origem] if col_origem else pd.NA
+@st.cache_data(ttl=300)
+def carregar_dados_investimentos(sheet_id=SHEET_ID, excel_path=None):
+    nome_carteira, nome_proventos, lista_abas = descobrir_abas(
+        sheet_id=sheet_id if sheet_id else None, 
+        excel_path=excel_path
+    )
 
-    out["data"] = out["data"].apply(parse_date)
-    for c in ["valor", "corretagem", "impostos"]:
-        out[c] = out[c].apply(parse_brl_number).astype("Float64")
-    out["quantidade"] = out["quantidade"].apply(parse_int).astype("Int64")
+    err = None
+    df_cart_raw = pd.DataFrame()
+    df_prov_raw = pd.DataFrame()
 
-    if "ticker" in out.columns:
-        out["ticker"] = (out["ticker"].astype("string")
-                         .str.upper().str.strip().str.replace(" ", "", regex=False))
-    for c in ["tipo", "instituicao"]:
-        out[c] = out[c].astype("string")
+    # Tenta ler CARTEIRA
+    lidos = []
+    for alvo in [nome_carteira] + [a for a in ALVOS_CARTEIRA if a != nome_carteira]:
+        try:
+            if excel_path:
+                df = pd.read_excel(excel_path, sheet_name=alvo, dtype=str)
+            else:
+                df = ler_gsheet_por_nome(sheet_id, alvo)
+            if df.shape[0] > 0 and df.shape[1] > 0:
+                df_cart_raw = df.copy()
+                lidos.append(("carteira", alvo))
+                break
+        except Exception as e:
+            err = f"Falha lendo carteira ({alvo}): {e}"
 
-    col_ordem = ["data", "ticker", "tipo", "quantidade", "valor",
-                 "corretagem", "impostos", "instituicao"]
-    out = out[col_ordem]
-    out = out[~(out["data"].isna() & out["valor"].isna())].reset_index(drop=True)
-    return out
+    # Tenta ler PROVENTOS
+    for alvo in [nome_proventos] + [a for a in ALVOS_PROVENTOS if a != nome_proventos]:
+        try:
+            if excel_path:
+                df = pd.read_excel(excel_path, sheet_name=alvo, dtype=str)
+            else:
+                df = ler_gsheet_por_nome(sheet_id, alvo)
+            if df.shape[0] > 0 and df.shape[1] > 0:
+                df_prov_raw = df.copy()
+                lidos.append(("proventos", alvo))
+                break
+        except Exception as e:
+            err = f"Falha lendo proventos ({alvo}): {e}"
 
-# =============================================================================
-# Padronização de Carteira
-# =============================================================================
+    return df_cart_raw, df_prov_raw, lidos, lista_abas, err
+
+# =========================
+# PADRONIZAÇÕES
+# =========================
 def padronizar_carteira(df_raw: pd.DataFrame) -> pd.DataFrame:
-    if df_raw is None or df_raw.empty:
-        return pd.DataFrame(columns=[
-            "ticker", "qtde", "pm", "preco_atual", "valor_posicao", "setor"
-        ])
+    """
+    Padroniza a aba '2. Lançamentos (B3)' para colunas principais:
+    ['data','ticker','tipo','quantidade','preco','total','taxa','irrf','classe','nome_acao']
+    """
+    if df_raw.empty:
+        return df_raw
 
-    mapa = {
-        "ticker": ["Ticker", "Ativo", "Código", "Codigo"],
-        "qtde": ["Quantidade (Liquida)", "Quantidade", "Qtd", "QTD"],
-        "pm": ["Preço Médio Ajustado R$", "PM", "Preço Médio", "Preco Medio"],
-        "preco_atual": ["Valor Atual", "Preço Atual", "Cotação", "Preco Atual", "Cotacao"],
-        "valor_posicao": ["Valor Investido", "Valor da Posição", "Valor Posicao", "Valor"],
-        "setor": ["Setor", "Classe", "Segmento"]
-    }
+    df = df_raw.copy()
+    # Primeiro tenta renomear as colunas que conhecemos na planilha modelo:
+    df = renomear_primeiro_match(df, ["Data (DD/MM/YYYY)", "Data\n(DD/MM/YYYY)", "Data"], "data")
+    df = renomear_primeiro_match(df, ["Ticker"], "ticker")
+    df = renomear_primeiro_match(df, ["Tipo de Operação", "Tipo Operação", "Operação"], "tipo")
+    df = renomear_primeiro_match(df, ["Quantidade", "Qtd", "Qtde"], "quantidade")
+    df = renomear_primeiro_match(df, ["Preço (por unidade)", "Preço\n(por unidade)", "Preço"], "preco")
+    df = renomear_primeiro_match(df, ["Total da Operação", "Total Operação"], "total")
+    df = renomear_primeiro_match(df, ["Taxa"], "taxa")
+    df = renomear_primeiro_match(df, ["IRRF"], "irrf")
+    df = renomear_primeiro_match(df, ["Classe"], "classe")
+    df = renomear_primeiro_match(df, ["Nome da ação", "Nome"], "nome_acao")
 
-    out = pd.DataFrame(index=df_raw.index)
-    for destino, candidatos in mapa.items():
-        col = next((c for c in candidatos if c in df_raw.columns), None)
-        out[destino] = df_raw[col] if col else pd.NA
+    # Converte tipos
+    if "data" in df.columns:
+        df["data"] = df["data"].apply(to_datetime_br)
 
-    out["ticker"] = (out["ticker"].astype("string")
-                     .str.upper().str.strip().str.replace(" ", "", regex=False))
-    for c in ["pm", "preco_atual", "valor_posicao"]:
-        out[c] = out[c].apply(parse_brl_number).astype("Float64")
-    out["qtde"] = out["qtde"].apply(parse_int).astype("Int64")
+    for c in ["quantidade", "preco", "total", "taxa", "irrf"]:
+        if c in df.columns:
+            df[c] = df[c].apply(limpar_numero_ptbr)
 
-    out = out[~out["ticker"].isna()].reset_index(drop=True)
-    return out
+    # Remove linhas totalmente vazias
+    df = df.dropna(how="all")
+    return df
 
-# =============================================================================
-# CARREGAMENTO
-# =============================================================================
-with st.spinner("Carregando dados da planilha..."):
-    df_cart_raw = ler_aba(SHEET_ID, ABAS_CARTEIRA, GIDS, dtype=str)
-    df_pv_raw   = ler_aba(SHEET_ID, ABAS_PROVENTOS, GIDS, dtype=str)
+def padronizar_proventos(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    A aba '3. Proventos' geralmente tem um cabeçalho em 2ª linha.
+    Detectamos a linha que contém 'Ticker' e reconstituímos o header.
+    Colunas padrão adotadas: ['ticker','tipo','data','quantidade','unitario','total']
+    (total é calculado se não vier)
+    """
+    if df_raw.empty:
+        return df_raw
 
-# Diagnóstico
-with st.expander("🔎 Diagnóstico das abas (colunas lidas)", expanded=False):
-    st.write("**Carteira (raw):**", df_cart_raw.shape)
-    if not df_cart_raw.empty:
-        st.write(list(df_cart_raw.columns))
-        st.dataframe(df_cart_raw.head(10), use_container_width=True)
+    df0 = df_raw.copy()
+
+    # Descobrir a linha de cabeçalho: onde a segunda coluna seja 'Ticker' (observado na planilha)
+    header_row = None
+    for i in range(min(10, len(df0))):
+        row = df0.iloc[i].tolist()
+        # Se em alguma das colunas está 'Ticker', usamos aquela linha como header
+        if any(str(x).strip().lower() == "ticker" for x in row):
+            header_row = i
+            break
+
+    if header_row is not None:
+        new_header = df0.iloc[header_row].tolist()
+        df = df0.iloc[header_row+1:].copy()
+        df.columns = new_header
     else:
-        st.warning("Aba de **Carteira** não encontrada por GID nem por nome.")
+        # Se não encontrar, segue como veio
+        df = df0.copy()
 
-    st.write("---")
-    st.write("**Proventos (raw):**", df_pv_raw.shape)
-    if not df_pv_raw.empty:
-        st.write(list(df_pv_raw.columns))
-        st.dataframe(df_pv_raw.head(10), use_container_width=True)
-    else:
-        st.warning("Aba de **Proventos** não encontrada por GID nem por nome.")
+    # Renomeia os campos importantes
+    df = renomear_primeiro_match(df, ["Ticker"], "ticker")
+    df = renomear_primeiro_match(df, ["Tipo Provento", "Tipo", "Evento"], "tipo")
+    df = renomear_primeiro_match(df, ["Data"], "data")
+    df = renomear_primeiro_match(df, ["Quantidade", "Qtd"], "quantidade")
+    df = renomear_primeiro_match(df, ["Unitário R$", "Unitario R$", "Unitário", "Unitario"], "unitario")
+    # Alguns modelos trazem 'Total Líquido'/'Total Liquido R$'
+    df = renomear_primeiro_match(df, ["Total Líquido", "Total Liquido R$", "Total"], "total")
 
-# Padronização
-CARTEIRA  = padronizar_carteira(df_cart_raw)
-PROVENTOS = padronizar_proventos(df_pv_raw)
+    # Converte tipos
+    if "data" in df.columns:
+        df["data"] = df["data"].apply(to_datetime_br)
+    for c in ["quantidade", "unitario", "total"]:
+        if c in df.columns:
+            df[c] = df[c].apply(limpar_numero_ptbr)
 
-# =============================================================================
-# UI / Resultados
-# =============================================================================
-col1, col2 = st.columns(2)
+    # Calcula total se faltar
+    if "total" not in df.columns and {"quantidade", "unitario"}.issubset(df.columns):
+        df["total"] = df["quantidade"] * df["unitario"]
 
-with col1:
-    st.subheader("📦 Carteira (padronizada)")
-    if CARTEIRA.empty:
+    # Mantém apenas colunas principais + extras úteis se existirem
+    keep = [c for c in ["ticker", "tipo", "data", "quantidade", "unitario", "total"] if c in df.columns]
+    extras = [c for c in df.columns if c not in keep]
+    df = df[keep + extras]
+
+    # Remove linhas vazias/ruído
+    df = df.dropna(how="all")
+    # Remove linhas onde ticker é nulo (após limpar cabeçalho)
+    if "ticker" in df.columns:
+        df = df[~df["ticker"].isna()]
+
+    return df
+
+# =========================
+# CARREGA E EXIBE
+# =========================
+with st.expander("🔎 Diagnóstico das abas (colunas lidas)", expanded=True):
+    df_cart_raw, df_prov_raw, lidos, lista_abas, err = carregar_dados_investimentos(
+        sheet_id=SHEET_ID, excel_path=EXCEL_LOCAL
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Carteira (raw)")
+        if not df_cart_raw.empty:
+            st.write(df_cart_raw.shape)
+            st.dataframe(df_cart_raw.head(10), use_container_width=True)
+        else:
+            st.warning("Aba de **Carteira** não encontrada por NOME (tentativas: " 
+                       + ", ".join(ALVOS_CARTEIRA) + ").")
+
+    with col2:
+        st.subheader("Proventos (raw)")
+        if not df_prov_raw.empty:
+            st.write(df_prov_raw.shape)
+            st.dataframe(df_prov_raw.head(10), use_container_width=True)
+        else:
+            st.warning("Aba de **Proventos** não encontrada por NOME (tentativas: " 
+                       + ", ".join(ALVOS_PROVENTOS) + ").")
+
+    if lidos:
+        st.caption("✔️ Abas reconhecidas: " + ", ".join([f"{t}:{n}" for t, n in lidos]))
+    if err:
+        st.error(err)
+
+# Padroniza
+df_carteira = padronizar_carteira(df_cart_raw)
+df_proventos = padronizar_proventos(df_prov_raw)
+
+st.markdown("---")
+c1, c2 = st.columns(2)
+
+with c1:
+    st.subheader("🧱 Carteira (padronizada)")
+    if df_carteira.empty:
         st.info("Nenhum dado de Carteira disponível.")
     else:
-        st.dataframe(CARTEIRA, use_container_width=True)
-        total_posicao = (CARTEIRA["valor_posicao"].fillna(0)).sum()
-        total_qtde = (CARTEIRA["qtde"].fillna(0)).sum()
-        m1, m2 = st.columns(2)
-        m1.metric("Valor total da posição", f"R$ {float(total_posicao or 0):,.2f}".replace(",", "v").replace(".", ",").replace("v", "."))
-        m2.metric("Total de papéis (qtde)", f"{int(total_qtde or 0)}")
+        # Métricas simples
+        qt_ops = len(df_carteira)
+        tickers = df_carteira["ticker"].dropna().nunique() if "ticker" in df_carteira.columns else 0
+        total_ops = df_carteira["total"].sum() if "total" in df_carteira.columns else np.nan
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Operações", f"{qt_ops:,}".replace(",", "."))
+        m2.metric("Tickers distintos", f"{tickers:,}".replace(",", "."))
+        m3.metric("Somatório Total da Operação", 
+                  "R$ {:,.2f}".format(total_ops if pd.notna(total_ops) else 0).replace(",", "v").replace(".", ",").replace("v", "."))
 
-with col2:
+        st.dataframe(df_carteira.head(50), use_container_width=True, height=400)
+
+with c2:
     st.subheader("💰 Proventos (padronizados)")
-    if PROVENTOS.empty:
+    if df_proventos.empty:
         st.info("Nenhum dado de Proventos disponível.")
     else:
-        st.dataframe(PROVENTOS, use_container_width=True)
-        proventos_validos = PROVENTOS.dropna(subset=["data", "valor"]).copy()
-        proventos_validos["ano"] = proventos_validos["data"].dt.year
-        agg = proventos_validos.groupby("ano", dropna=True)["valor"].sum().reset_index()
-        if not agg.empty:
-            st.bar_chart(agg.set_index("ano"))
-        total_prov = float(proventos_validos["valor"].sum() or 0.0)
-        st.metric("Total de proventos", f"R$ {total_prov:,.2f}".replace(",", "v").replace(".", ",").replace("v", "."))
+        # Métricas simples
+        qt_linhas = len(df_proventos)
+        tickers_p = df_proventos["ticker"].dropna().nunique() if "ticker" in df_proventos.columns else 0
+        total_prov = df_proventos["total"].sum() if "total" in df_proventos.columns else np.nan
+        n1, n2, n3 = st.columns(3)
+        n1.metric("Registros", f"{qt_linhas:,}".replace(",", "."))
+        n2.metric("Tickers (proventos)", f"{tickers_p:,}".replace(",", "."))
+        n3.metric("Total (estimado)", 
+                  "R$ {:,.2f}".format(total_prov if pd.notna(total_prov) else 0).replace(",", "v").replace(".", ",").replace("v", "."))
 
-st.caption("Se alguma aba não carregar, confira `SHEET_ID`, `GIDS` e os nomes em `ABAS_CARTEIRA` / `ABAS_PROVENTOS`.")
+        st.dataframe(df_proventos.head(50), use_container_width=True, height=400)
+
+# =========================
+# SIDEBAR: navegação simples
+# =========================
+st.sidebar.markdown("## app investimentos")
+st.sidebar.button("Carteira", use_container_width=True)
+st.sidebar.button("Proventos", use_container_width=True)
+
+st.caption("Se alguma aba não carregar, confira o **SHEET_ID** e os nomes em `ALVOS_CARTEIRA` / `ALVOS_PROVENTOS`.")
