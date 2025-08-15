@@ -139,57 +139,71 @@ def carregar_tabela(sheet_id: str, alvo_nomes: list, gid: str|None):
         st.error(msg)
         raise
 
-# ======== LOAD: PROVENTOS ========
 @st.cache_data(ttl=300)
 def load_proventos(sheet_id: str) -> pd.DataFrame:
     df = carregar_tabela(sheet_id, PROVENTOS_ALVOS, GID_PROVENTOS)
 
+    # --- mapeia nomes flexíveis
     col_ticker    = pick_col(df, ["Ticker"])
     col_tipo      = pick_col(df, ["Tipo Provento","Tipo","Provento"])
     col_data      = pick_col(df, ["Data"])
-    col_qtd       = pick_col(df, ["Quantidade"])
-    col_unit      = pick_col(df, ["Unitário R$","Unitario R$","Unitário","Unitario"])
+    col_qtd       = pick_col(df, ["Quantidade","Qtd"])
+    col_unit      = pick_col(df, ["Unitário R$","Unitario R$","Unitário","Unitario","Valor por cota","Valor unitário"])
     col_tot_liq   = pick_col(df, ["Total Líquido R$","Total Liquido R$","Total Líquido","Total Liquido"])
-    col_irrf      = pick_col(df, ["IRRF"])
-    col_ptax      = pick_col(df, ["PTAX"])
+    col_irrf      = pick_col(df, ["IRRF","Imposto","Impostos"])
+    col_ptax      = pick_col(df, ["PTAX","Ptax"])
     col_tot_bruto = pick_col(df, ["Total Bruto R$","Total Bruto"])
     col_mes       = pick_col(df, ["Mês","Mes"])
     col_ano       = pick_col(df, ["Ano"])
-    col_classe    = pick_col(df, ["Classe do Ativo","Classe"])
+    col_classe    = pick_col(df, ["Classe do Ativo","Classe","Classe do ativo"])
 
     rename = {}
-    if col_ticker:    rename[col_ticker] = "Ticker"
-    if col_tipo:      rename[col_tipo] = "Tipo"
-    if col_data:      rename[col_data] = "Data"
-    if col_qtd:       rename[col_qtd] = "Quantidade"
-    if col_unit:      rename[col_unit] = "Unitario_R$"
-    if col_tot_liq:   rename[col_tot_liq] = "Total_Liquido_R$"
-    if col_irrf:      rename[col_irrf] = "IRRF"
-    if col_ptax:      rename[col_ptax] = "PTAX"
+    if col_ticker:    rename[col_ticker]    = "Ticker"
+    if col_tipo:      rename[col_tipo]      = "Tipo"
+    if col_data:      rename[col_data]      = "Data"
+    if col_qtd:       rename[col_qtd]       = "Quantidade"
+    if col_unit:      rename[col_unit]      = "Unitario_R$"
+    if col_tot_liq:   rename[col_tot_liq]   = "Total_Liquido_R$"
+    if col_irrf:      rename[col_irrf]      = "IRRF"
+    if col_ptax:      rename[col_ptax]      = "PTAX"
     if col_tot_bruto: rename[col_tot_bruto] = "Total_Bruto_R$"
-    if col_mes:       rename[col_mes] = "Mes"
-    if col_ano:       rename[col_ano] = "Ano"
-    if col_classe:    rename[col_classe] = "Classe"
+    if col_mes:       rename[col_mes]       = "Mes"
+    if col_ano:       rename[col_ano]       = "Ano"
+    if col_classe:    rename[col_classe]    = "Classe"
+
     df = df.rename(columns=rename)
 
-    if "Data" in df.columns: df["Data"] = df["Data"].map(to_date_br)
-    if "Quantidade" in df.columns: df["Quantidade"] = df["Quantidade"].map(to_int_safe)
+    # --- garante que TODAS as colunas existam (evita KeyError)
+    required = ["Ticker","Tipo","Data","Quantidade","Unitario_R$","Total_Liquido_R$",
+                "IRRF","PTAX","Total_Bruto_R$","Mes","Ano","Classe"]
+    for c in required:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    # --- limpeza/conversões
+    df["Data"]        = df["Data"].map(to_date_br)
+    df["Quantidade"]  = df["Quantidade"].map(to_int_safe)
     for c in ["Unitario_R$","Total_Liquido_R$","Total_Bruto_R$","IRRF","PTAX"]:
-        if c in df.columns: df[c] = df[c].map(to_float_br)
+        df[c] = df[c].map(to_float_br)
 
-    if "Data" in df.columns:
-        if "Ano" not in df.columns: df["Ano"] = pd.Series([d.year if pd.notna(d) else np.nan for d in df["Data"]])
-        if "Mes" not in df.columns: df["Mes"] = pd.Series([MESES_PT.get(d.month) if pd.notna(d) else np.nan for d in df["Data"]])
+    # --- completa Ano/Mes se faltarem
+    if df["Data"].notna().any():
+        df.loc[df["Ano"].isna(), "Ano"] = [d.year  if pd.notna(d) else np.nan for d in df["Data"]]
+        df.loc[df["Mes"].isna(), "Mes"] = [MESES_PT.get(d.month) if pd.notna(d) else np.nan for d in df["Data"]]
 
-    if "Total_Liquido_R$" not in df.columns:
-        df["Total_Liquido_R$"] = np.nan
-    mask = df["Total_Liquido_R$"].isna() & df["Quantidade"].notna() & df["Unitario_R$"].notna()
-    df.loc[mask, "Total_Liquido_R$"] = df.loc[mask, "Quantidade"] * df.loc[mask, "Unitario_R$"]
-    if "IRRF" in df.columns:
-        df.loc[mask & df["IRRF"].notna(), "Total_Liquido_R$"] -= df.loc[mask & df["IRRF"].notna(), "IRRF"]
+    # --- calcula Total_Liquido_R$ apenas quando der
+    have_qtd  = df["Quantidade"].notna()
+    have_uni  = df["Unitario_R$"].notna()
+    need_calc = df["Total_Liquido_R$"].isna() & have_qtd & have_uni
 
-    if "Classe" not in df.columns: df["Classe"] = ""
-    df = df[df.get("Ticker","").astype(str).str.strip()!=""]
+    df.loc[need_calc, "Total_Liquido_R$"] = df.loc[need_calc, "Quantidade"] * df.loc[need_calc, "Unitario_R$"]
+    df.loc[need_calc & df["IRRF"].notna(), "Total_Liquido_R$"] -= df.loc[need_calc & df["IRRF"].notna(), "IRRF"]
+
+    # --- limpa linhas vazias de ticker
+    df = df[df["Ticker"].astype(str).str.strip() != ""].copy()
+    # normaliza classe vazia
+    df["Classe"] = df["Classe"].fillna("")
+
     return df
 
 # ======== LOAD: MEUS ATIVOS ========
