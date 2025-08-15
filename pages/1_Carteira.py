@@ -14,7 +14,7 @@ from datetime import date
 from urllib.parse import quote
 import re, unicodedata
 
-st.set_page_config(page_title="📈 Investimentos – Linkado ao Google Sheets",
+st.set_page_config(page_title="📈 Investimentos",
                    page_icon="📈", layout="wide")
 st.title("📈 Painel de Investimentos – Linkado ao Google Sheets")
 PLOTLY_TEMPLATE = "plotly_dark"
