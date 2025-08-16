@@ -1,365 +1,201 @@
-# 101_Resumo_Investimentos.py
-import streamlit as st
-import pandas as pd
-import numpy as np
+# APP_Proventos.py
+# Lê a aba APP_Proventos por GID, corrige parse pt-BR e soma o Total Líquido ORIGINAL da planilha.
+
 import re
-from io import BytesIO
-from urllib.parse import quote
-from datetime import datetime, timedelta
+import pandas as pd
+import streamlit as st
 
-st.set_page_config(page_title="Proventos & Calendário", page_icon="💸", layout="wide")
-st.title("💸 Proventos & Calendário")
+st.set_page_config(page_title="APP | Proventos", page_icon="💸", layout="wide")
+st.title("💸 Proventos & Calendário — APP_Proventos (planilha)")
 
-# === CONFIG ===
+# =========================
+# CONFIG
+# =========================
 SHEET_ID = "1TQBzbueeBTgNmXwZPg04GFOwNL4vh_1ZbKlDAGQJ09o"
-PROVENTOS_ALVOS   = ["APP_Proventos"]
-MEUS_ATIVOS_ALVOS = ["APP_MeusAtivos"]
-GID_PROVENTOS   = "2109089485"
-GID_MEUS_ATIVOS = None
+GID_APP_PROVENTOS = "1322179207"   # aba APP_Proventos
 
-MESES_PT = {1:"janeiro",2:"fevereiro",3:"março",4:"abril",5:"maio",6:"junho",
-            7:"julho",8:"agosto",9:"setembro",10:"outubro",11:"novembro",12:"dezembro"}
-COL_ORDEM_MESES = list(MESES_PT.values())
+CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={GID_APP_PROVENTOS}"
 
-# === HELPERS ===
-def csv_url_by_name(sheet_id, sheet_name):
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&sheet={quote(sheet_name)}"
-def csv_url_by_gid(sheet_id, gid):
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
-
-def to_float_br(x):
-    if pd.isna(x): return np.nan
+# =========================
+# HELPERS
+# =========================
+def parse_brl(x):
+    """Converte strings em pt-BR para float (R$ 1.234,56 -> 1234.56).
+       Aceita numérico, vazio, 'R$ ', etc."""
+    if pd.isna(x):
+        return 0.0
+    if isinstance(x, (int, float)):
+        return float(x)
     s = str(x).strip()
-    s = (s.replace("R$","").replace("US$","").replace("$","").replace("€","").replace(" ",""))
-    s = s.replace(".","").replace(",",".")
-    try: return float(s)
-    except: return np.nan
-def to_int_safe(x):
+    if s == "":
+        return 0.0
+    s = s.replace("R$", "").replace(" ", "")
+    # vírgula decimal: troca vírgula por ponto e remove separador de milhar
+    if re.search(r",\d{1,4}$", s):
+        s = s.replace(".", "").replace(",", ".")
     try:
-        if pd.isna(x) or str(x).strip()=="": return np.nan
-        return int(float(str(x).replace(",",".").strip()))
-    except: return np.nan
-def to_date_br(x):
-    if pd.isna(x) or str(x).strip()=="": return pd.NaT
-    s = str(x).strip()
-    for fmt in ("%d/%m/%Y","%Y-%m-%d","%d-%m-%Y"):
-        try: return datetime.strptime(s, fmt).date()
-        except: pass
-    try: return pd.to_datetime(s, dayfirst=True).date()
-    except: return pd.NaT
-def pick_col(df, candidates):
-    cols = {c.lower().strip(): c for c in df.columns}
-    for cand in candidates:
-        k = cand.lower().strip()
-        if k in cols: return cols[k]
-    for cand in candidates:
-        for k, orig in cols.items():
-            if k.startswith(cand.lower().strip()): return orig
-    return None
-def fmt_moeda(v):
-    try: return "R$ " + f"{float(v):,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
-    except: return v
-def realinha_cabecalho(df, procurar=("ticker","data")):
-    for i in range(min(25, len(df))):
-        linha = df.iloc[i].astype(str).str.strip().str.lower().tolist()
-        if any(procurar[0] in x for x in linha) and any(procurar[1] in x for x in linha):
-            cols = df.iloc[i].tolist()
-            df2 = df.iloc[i+1:].copy()
-            df2.columns = cols
-            return df2.dropna(how="all").dropna(axis=1, how="all")
-    return df
+        return float(s)
+    except:
+        return 0.0
 
-# === LOAD BASE ===
-@st.cache_data(ttl=300)
-def carregar_via_service_account(sheet_id, alvo_nomes):
+def parse_int(x):
     try:
-        import gspread
-        from gspread_dataframe import get_as_dataframe
-        from google.oauth2.service_account import Credentials
-        info = st.secrets.get("gcp_service_account") or st.secrets.get("GCP_SERVICE_ACCOUNT")
-        if not info: return None
-        creds = Credentials.from_service_account_info(
-            info,
-            scopes=["https://www.googleapis.com/auth/spreadsheets.readonly",
-                    "https://www.googleapis.com/auth/drive.readonly"]
+        return int(float(str(x).replace(",", ".").strip()))
+    except:
+        return 0
+
+def normalizar_colunas(df):
+    """Padroniza nomes mesmo que venham com variações."""
+    def norm(c):
+        c = (
+            c.lower()
+             .replace("(", " ").replace(")", " ")
+             .replace("/", " ").replace("-", " ").replace(".", " ")
+             .replace("  ", " ").strip()
         )
-        gc = gspread.authorize(creds)
-        sh = gc.open_by_key(sheet_id)
-        def norm(s): return re.sub(r"\s+"," ", re.sub(r"[^\w]+"," ", s.lower())).strip()
-        mapa = {norm(ws.title): ws for ws in sh.worksheets()}
-        for nome in alvo_nomes:
-            if norm(nome) in mapa:
-                ws = mapa[norm(nome)]
-                df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str)
-                return df.dropna(how="all").dropna(axis=1, how="all")
-        return None
-    except Exception:
-        return None
+        mapa_acentos = (("á","a"),("à","a"),("ã","a"),("â","a"),
+                        ("é","e"),("ê","e"),("í","i"),
+                        ("ó","o"),("ô","o"),("õ","o"),
+                        ("ú","u"),("ç","c"))
+        for a,b in mapa_acentos:
+            c = c.replace(a,b)
+        return c.replace(" ", "_")
 
-@st.cache_data(ttl=300)
-def carregar_via_csv(sheet_id, alvo_nomes, gid):
-    last_err = None
-    for nome in alvo_nomes:
-        try:  return pd.read_csv(csv_url_by_name(sheet_id, nome), dtype=str)
-        except Exception as e: last_err = e
-    if gid:
-        try:  return pd.read_csv(csv_url_by_gid(sheet_id, gid), dtype=str)
-        except Exception as e: last_err = e
-    raise last_err if last_err else RuntimeError("Falha ao carregar CSV")
+    df = df.copy()
+    df.columns = [norm(c) for c in df.columns]
 
-def carregar_tabela(sheet_id, alvo_nomes, gid):
-    df = carregar_via_service_account(sheet_id, alvo_nomes)
-    if df is not None: return df
-    return carregar_via_csv(sheet_id, alvo_nomes, gid)
+    mapa = {
+        "ticker":"ticker", "ativo":"ticker", "codigo":"ticker",
+        "data":"data",
+        "tipo":"tipo","evento":"tipo",
+        "quantidade":"quantidade","qtd":"quantidade","qtd_liquida":"quantidade",
+        "unitario_r$":"unitario_rs","unitario":"unitario_rs","valor_unitario":"unitario_rs",
+        "provento_unitario":"unitario_rs","valor_por_cota":"unitario_rs",
+        "irrf":"irrf","imposto":"irrf",
+        # valor líquido original da planilha (o que deve ser somado)
+        "total_liquido_r$":"total_liquido_orig_rs","total_final_r$":"total_liquido_orig_rs",
+        "valor_liquido":"total_liquido_orig_rs","total_liquido":"total_liquido_orig_rs",
+        "liquido_r$":"total_liquido_orig_rs"
+    }
+    df = df.rename(columns={c: mapa.get(c,c) for c in df.columns})
+    return df
 
-# === LOAD PROVENTOS ===
-@st.cache_data(ttl=300)
-def load_proventos(sheet_id):
-    df = carregar_tabela(sheet_id, PROVENTOS_ALVOS, GID_PROVENTOS)
-    df = realinha_cabecalho(df)
+def preparar_proventos(df):
+    df = normalizar_colunas(df)
 
-    # pega total original da planilha (se existir)
-    orig_tot_col = pick_col(df, ["Total Líquido R$","Total Liquido R$","Total Líquido","Total Liquido"])
-    orig_tot_series = df[orig_tot_col].copy() if orig_tot_col else None
+    # datas
+    if "data" in df.columns:
+        df["data"] = pd.to_datetime(df["data"], errors="coerce", dayfirst=True)
 
-    # map/rename
-    col_ticker = pick_col(df, ["Ticker"])
-    col_tipo   = pick_col(df, ["Tipo Provento","Tipo","Provento"])
-    col_data   = pick_col(df, ["Data"])
-    col_qtd    = pick_col(df, ["Quantidade","Qtd"])
-    col_unit   = pick_col(df, ["Unitário R$","Unitario R$","Unitário","Unitario","Valor por cota","Valor unitário"])
-    col_irrf   = pick_col(df, ["IRRF","Imposto","Impostos"])
-    col_mes    = pick_col(df, ["Mês","Mes"])
-    col_ano    = pick_col(df, ["Ano"])
-    col_class  = pick_col(df, ["Classe do Ativo","Classe","Classe do ativo"])
+    # numéricos
+    if "quantidade" in df.columns: df["quantidade"] = df["quantidade"].apply(parse_int)
+    else: df["quantidade"] = 0
 
-    rename = {}
-    if col_ticker: rename[col_ticker] = "Ticker"
-    if col_tipo:   rename[col_tipo]   = "Tipo"
-    if col_data:   rename[col_data]   = "Data"
-    if col_qtd:    rename[col_qtd]    = "Quantidade"
-    if col_unit:   rename[col_unit]   = "Unitario_R$"
-    if col_irrf:   rename[col_irrf]   = "IRRF"
-    if col_mes:    rename[col_mes]    = "Mes"
-    if col_ano:    rename[col_ano]    = "Ano"
-    if col_class:  rename[col_class]  = "Classe"
-    df = df.rename(columns=rename)
+    if "unitario_rs" in df.columns: df["unitario_rs"] = df["unitario_rs"].apply(parse_brl)
+    else: df["unitario_rs"] = 0.0
 
-    for c in ["Ticker","Tipo","Data","Quantidade","Unitario_R$","IRRF","Mes","Ano","Classe"]:
-        if c not in df.columns: df[c] = np.nan
+    if "irrf" in df.columns: df["irrf"] = df["irrf"].apply(parse_brl)
+    else: df["irrf"] = 0.0
 
-    # conversões
-    df["Data"]        = df["Data"].map(to_date_br)
-    df["Quantidade"]  = df["Quantidade"].map(to_int_safe)
-    df["Unitario_R$"] = df["Unitario_R$"].map(to_float_br)
-    df["IRRF"]        = df["IRRF"].map(to_float_br)
-
-    if df["Data"].notna().any():
-        ano_series = df["Data"].apply(lambda d: d.year if pd.notna(d) else np.nan)
-        mes_series = df["Data"].apply(lambda d: MESES_PT.get(d.month) if pd.notna(d) else np.nan)
-        df["Ano"] = pd.to_numeric(df["Ano"], errors="coerce").fillna(ano_series)
-        df["Mes"] = df["Mes"].fillna(mes_series)
-
-    # cálculo (sempre disponível)
-    df[["Quantidade","Unitario_R$","IRRF"]] = df[["Quantidade","Unitario_R$","IRRF"]].fillna(0)
-    df["Total_Liquido_R$"] = (df["Quantidade"] * df["Unitario_R$"] - df["IRRF"]).clip(lower=0)
-
-    # total original (se existir)
-    if orig_tot_series is not None:
-        df["Total_Liquido_Orig_R$"] = pd.to_numeric(orig_tot_series.map(to_float_br), errors="coerce")
+    if "total_liquido_orig_rs" in df.columns:
+        df["total_liquido_orig_rs"] = df["total_liquido_orig_rs"].apply(parse_brl)
     else:
-        df["Total_Liquido_Orig_R$"] = np.nan
+        df["total_liquido_orig_rs"] = 0.0
 
-    # === coluna final usada pelo app ===
-    df["Total_Final_R$"] = np.where(
-        df["Total_Liquido_Orig_R$"].notna(),
-        df["Total_Liquido_Orig_R$"],
-        df["Total_Liquido_R$"]
-    )
+    # cálculo paralelo (auditoria)
+    df["total_liquido_calc_rs"] = (df["quantidade"] * df["unitario_rs"]) - df["irrf"]
 
-    df = df[df["Ticker"].astype(str).str.strip() != ""].copy()
-    df["Classe"] = df["Classe"].fillna("")
+    # guard-rail: se unitário mediano está alto, provavelmente veio em centavos -> divide por 100
+    med = df["unitario_rs"].median(skipna=True)
+    if pd.notna(med) and med > 20:
+        df["unitario_rs"] = df["unitario_rs"] / 100.0
+        df["total_liquido_calc_rs"] = (df["quantidade"] * df["unitario_rs"]) - df["irrf"]
+
+    df["diff_final_calc"] = df["total_liquido_calc_rs"] - df["total_liquido_orig_rs"]
     return df
 
-# === LOAD MEUS ATIVOS ===
 @st.cache_data(ttl=300)
-def load_meus_ativos(sheet_id):
-    df = carregar_tabela(sheet_id, MEUS_ATIVOS_ALVOS, GID_MEUS_ATIVOS)
-    df = realinha_cabecalho(df)
+def carregar_df():
+    # lê a aba APP_Proventos por gid (CSV export)
+    df = pd.read_csv(CSV_URL, dtype=str)  # não deixa o pandas adivinhar número/moeda
+    return preparar_proventos(df)
 
-    col_ticker = pick_col(df, ["Ticker"])
-    col_pct    = pick_col(df, ["% na Carteira","% na carteira"])
-    col_pos    = pick_col(df, ["Posição","Posicao"])
-    col_class  = pick_col(df, ["Classe"])
-    col_qtd    = pick_col(df, ["Quantidade (Líquida)","Quantidade","Qtd"])
-    col_pm     = pick_col(df, ["Preço Médio Ajustado (R$)","Preço Médio Ajustado","PM Ajustado"])
-    col_cot    = pick_col(df, ["Cotação de Hoje (R$)","Cotação de Hoje","Cotacao de Hoje"])
-
-    rename = {}
-    if col_ticker: rename[col_ticker] = "Ticker"
-    if col_pct:    rename[col_pct]    = "Pct_Carteira"
-    if col_pos:    rename[col_pos]    = "Posicao"
-    if col_class:  rename[col_class]  = "Classe"
-    if col_qtd:    rename[col_qtd]    = "Qtd_Liquida"
-    if col_pm:     rename[col_pm]     = "PM_Ajustado_R$"
-    if col_cot:    rename[col_cot]    = "Cotacao_R$"
-    df = df.rename(columns=rename)
-
-    if "Pct_Carteira" in df.columns:
-        df["Pct_Carteira"] = (df["Pct_Carteira"].astype(str).str.replace("%","",regex=False).map(to_float_br)/100.0)
-    if "Qtd_Liquida" in df.columns:   df["Qtd_Liquida"] = df["Qtd_Liquida"].map(to_int_safe)
-    if "PM_Ajustado_R$" in df.columns: df["PM_Ajustado_R$"] = df["PM_Ajustado_R$"].map(to_float_br)
-    if "Cotacao_R$" in df.columns:     df["Cotacao_R$"] = df["Cotacao_R$"].map(to_float_br)
-
-    qtd = df.get("Qtd_Liquida", pd.Series(0)).fillna(0)
-    cot = df.get("Cotacao_R$",   pd.Series(0)).fillna(0)
-    pm  = df.get("PM_Ajustado_R$", pd.Series(0)).fillna(0)
-
-    if "Posicao" not in df.columns or df["Posicao"].isna().all():
-        df["Posicao"] = np.where(qtd>0, "Ativa", "Encerrada")
-
-    valor_atual     = (cot * qtd)
-    valor_investido = (pm  * qtd)
-    base = valor_atual.where(valor_atual>0, valor_investido)
-    total_base = base.sum()
-    df["Pct_Carteira"] = np.where(total_base>0, base/total_base, 0.0)
-
-    if "Classe" not in df.columns: df["Classe"] = ""
-    return df
-
-# === DADOS ===
-prov = load_proventos(SHEET_ID)
-ativos = load_meus_ativos(SHEET_ID)
-
-if st.sidebar.checkbox("🔧 Mostrar colunas detectadas (debug)"):
-    st.write("Proventos:", sorted(prov.columns.tolist()))
-    st.write("Meus Ativos:", sorted(ativos.columns.tolist()))
-
-prov["Ano_num"] = pd.to_numeric(prov.get("Ano"), errors="coerce")
-if prov["Ano_num"].isna().all() and "Data" in prov.columns:
-    prov["Ano_num"] = prov["Data"].apply(lambda d: d.year if pd.notna(d) else np.nan)
-
-anos_disponiveis = sorted([int(a) for a in prov["Ano_num"].dropna().unique()])
-if not anos_disponiveis:
-    st.error("Não encontrei anos válidos em 'Proventos'. Verifique a coluna 'Data'.")
-    st.stop()
-
-# === FILTROS ===
-ano_sel    = st.sidebar.selectbox("Ano", anos_disponiveis[::-1])
-classes    = ["(todas)"] + sorted([c for c in prov["Classe"].dropna().unique() if str(c).strip()!=""])
-classe_sel = st.sidebar.selectbox("Classe", classes, index=0)
-posicoes   = ["(todas)","Ativa","Encerrada"]
-pos_sel    = st.sidebar.selectbox("Posição", posicoes, index=0)
-tickers_all= ["(todos)"] + sorted(prov["Ticker"].dropna().unique())
-ticker_sel = st.sidebar.selectbox("Ticker", tickers_all, index=0)
-
-df = prov[prov["Ano_num"]==int(ano_sel)].copy()
-if classe_sel!="(todas)": df = df[df["Classe"]==classe_sel]
-if pos_sel!="(todas)":
-    df = df.merge(ativos[["Ticker","Posicao"]], on="Ticker", how="left")
-    df = df[df["Posicao"].fillna("(desconhecida)")==pos_sel]
-if ticker_sel!="(todos)": df = df[df["Ticker"]==ticker_sel]
-
+# =========================
+# LOAD
+# =========================
+df = carregar_df()
 if df.empty:
-    st.warning("Sem registros para os filtros escolhidos.")
+    st.warning("Não encontrei dados na aba APP_Proventos.")
     st.stop()
 
-# === AUDITORIA ===
-with st.expander("🔎 Auditoria — linhas com maior valor (cálculo vs. planilha)", expanded=False):
-    c1,c2,c3 = st.columns(3)
-    c1.metric("Soma usada (FINAL)", fmt_moeda(df["Total_Final_R$"].sum()))
-    c2.metric("Soma planilha (orig.)", fmt_moeda(df["Total_Liquido_Orig_R$"].sum()))
-    c3.metric("Soma calculada", fmt_moeda(df["Total_Liquido_R$"].sum()))
-    audit = df.assign(
-        Diff_final_orig = df["Total_Final_R$"] - df["Total_Liquido_Orig_R$"],
-        Diff_final_calc = df["Total_Final_R$"] - df["Total_Liquido_R$"]
-    )
-    st.dataframe(
-        audit.sort_values("Total_Final_R$", ascending=False)[
-            ["Ticker","Data","Tipo","Quantidade","Unitario_R$","IRRF",
-             "Total_Final_R$","Total_Liquido_Orig_R$","Total_Liquido_R$",
-             "Diff_final_orig","Diff_final_calc"]
-        ].head(25),
-        use_container_width=True
-    )
+# =========================
+# FILTROS
+# =========================
+col_f1, col_f2, col_f3, col_f4 = st.columns([1,1,1,2])
 
-# === CALENDÁRIO ===
-df["Mes"] = pd.Categorical(df["Mes"], categories=COL_ORDEM_MESES, ordered=True)
-g_mes_ticker = df.groupby(["Ticker","Mes"], dropna=False)["Total_Final_R$"].sum().reset_index()
-pivot = g_mes_ticker.pivot(index="Ticker", columns="Mes", values="Total_Final_R$").fillna(0.0)
-pivot = pivot.reindex(columns=COL_ORDEM_MESES, fill_value=0.0)
-pivot["Total no ano"] = pivot.sum(axis=1)
+with col_f1:
+    tickers = ["(Todos)"] + sorted([t for t in df["ticker"].dropna().astype(str).unique() if t.strip() != ""])
+    tk = st.selectbox("Ticker", tickers, index=0)
 
-total_ano = pivot["Total no ano"].sum()
-media_mensal = total_ano/12.0
-melhor_mes_idx = pivot.drop(columns=["Total no ano"]).sum().idxmax()
-melhor_mes_val = pivot.drop(columns=["Total no ano"]).sum().max()
+with col_f2:
+    anos = ["(Todos)"] + sorted(df["data"].dt.year.dropna().astype(int).unique().tolist())
+    ano = st.selectbox("Ano", anos, index=0)
 
-# Metadados
-meta_cols = ["Ticker","Classe","Pct_Carteira","Posicao"]
-for c in ["Classe","Posicao","Pct_Carteira"]:
-    if c not in ativos.columns:
-        ativos[c] = "" if c!="Pct_Carteira" else 0.0
-meta = ativos[meta_cols].copy()
-meta["Pct_Carteira"] = meta["Pct_Carteira"].fillna(0.0)
-tabela = meta.merge(pivot.reset_index(), on="Ticker", how="right").fillna(0.0)
+with col_f3:
+    tipos = ["(Todos)"] + sorted([t for t in df.get("tipo", pd.Series(dtype=str)).fillna("").unique() if str(t).strip()!=""])
+    tipo = st.selectbox("Tipo", tipos, index=0)
 
-# === YIELDS ===
-dez31 = datetime(int(ano_sel),12,31).date()
-ini12 = (datetime(int(ano_sel),12,31) - timedelta(days=365)).date()
-prov_12m = prov[(prov["Data"].notna()) & (prov["Data"]>ini12) & (prov["Data"]<=dez31)]
-agg_12m = prov_12m.groupby("Ticker")["Total_Final_R$"].sum().reset_index().rename(columns={"Total_Final_R$":"Prov_12m_R$"})
-ult_unit = (df.sort_values("Data").dropna(subset=["Unitario_R$"])
-              .groupby("Ticker")["Unitario_R$"].last().reset_index()
-              .rename(columns={"Unitario_R$":"Ultimo_Unitario_R$"}))
-yields = ativos[["Ticker","Qtd_Liquida","PM_Ajustado_R$","Cotacao_R$"]].copy()
-yields = yields.merge(agg_12m, on="Ticker", how="left").merge(ult_unit, on="Ticker", how="left")
-yields["Valor_Atual_R$"] = yields["Cotacao_R$"] * yields["Qtd_Liquida"]
-yields["DY_12m"] = np.where(yields["Valor_Atual_R$"]>0, yields["Prov_12m_R$"]/yields["Valor_Atual_R$"], np.nan)
-yields["YOC"]    = np.where(yields["PM_Ajustado_R$"]>0, yields["Ultimo_Unitario_R$"]/yields["PM_Ajustado_R$"], np.nan)
-yields["Yield_mensal"] = yields["YOC"]
-tabela = tabela.merge(yields[["Ticker","DY_12m","YOC","Yield_mensal"]], on="Ticker", how="left")
+with col_f4:
+    busca = st.text_input("Busca livre (descrição/observações, se houver)", "")
 
-# === UI ===
-c1,c2,c3 = st.columns(3)
-c1.metric("Total no ano", fmt_moeda(total_ano))
-c2.metric("Média mensal (12 meses)", fmt_moeda(media_mensal))
-c3.metric(f"Melhor mês ({melhor_mes_idx})", fmt_moeda(melhor_mes_val))
+df_f = df.copy()
+if tk != "(Todos)":
+    df_f = df_f[df_f["ticker"].astype(str).str.upper() == tk.upper()]
+if ano != "(Todos)":
+    df_f = df_f[df_f["data"].dt.year == int(ano)]
+if tipo != "(Todos)":
+    df_f = df_f[df_f["tipo"].astype(str).str.upper() == str(tipo).upper()]
+if busca.strip():
+    # procura em todas as colunas de texto
+    mask = pd.Series(False, index=df_f.index)
+    for c in df_f.columns:
+        if df_f[c].dtype == "O":
+            mask = mask | df_f[c].astype(str).str.contains(busca, case=False, na=False)
+    df_f = df_f[mask]
 
-st.markdown("### Calendário por Ticker (Jan–Dez)")
-tabela_view = tabela.copy()
-for col in COL_ORDEM_MESES + ["Total no ano"]:
-    if col in tabela_view.columns: tabela_view[col] = tabela_view[col].map(fmt_moeda)
-for col in ["Pct_Carteira","DY_12m","YOC","Yield_mensal"]:
-    if col in tabela_view.columns:
-        tabela_view[col] = tabela_view[col].apply(lambda x: "-" if pd.isna(x) else f"{100*float(x):.2f}%")
-st.dataframe(tabela_view, use_container_width=True, hide_index=True)
+# =========================
+# MÉTRICAS
+# =========================
+# Soma OFICIAL sempre do valor líquido ORIGINAL da planilha.
+soma_oficial = df_f["total_liquido_orig_rs"].sum()
+# fallback se a planilha não tiver essa coluna preenchida
+if soma_oficial == 0:
+    soma_oficial = df_f["total_liquido_calc_rs"].sum()
 
-st.markdown("### Ranking de Proventos no Ano")
-ranking = pivot["Total no ano"].sort_values(ascending=False).reset_index()
-ranking.columns = ["Ticker","Total no ano (R$)"]
-ranking["Total no ano (R$)"] = ranking["Total no ano (R$)"].map(fmt_moeda)
-st.dataframe(ranking, use_container_width=True, hide_index=True)
+soma_calc = df_f["total_liquido_calc_rs"].sum()
+dif = soma_calc - df_f["total_liquido_orig_rs"].sum()
 
-# === DOWNLOAD (openpyxl -> CSV fallback) ===
-def to_excel_or_csv_bytes(df):
-    try:
-        out = BytesIO()
-        with pd.ExcelWriter(out, engine="openpyxl") as w:
-            df.to_excel(w, index=False, sheet_name="Calendario")
-        return out.getvalue(), "xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    except Exception:
-        return df.to_csv(index=False).encode("utf-8"), "csv", "text/csv"
+def fmt_brl(v):
+    return f"R$ {v:,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
 
-data_bytes, ext, mime = to_excel_or_csv_bytes(tabela)
-st.download_button(f"⬇️ Baixar Calendário ({ext.upper()})",
-                   data=data_bytes,
-                   file_name=f"calendario_proventos_{ano_sel}.{ext}",
-                   mime=mime)
+m1, m2, m3 = st.columns(3)
+m1.metric("Soma usada (FINAL / planilha)", fmt_brl(soma_oficial))
+m2.metric("Soma calculada (auditoria)", fmt_brl(soma_calc))
+m3.metric("Diferença (calc - planilha)", fmt_brl(dif))
 
-st.download_button("⬇️ Baixar Ranking (CSV)",
-                   data=ranking.to_csv(index=False).encode("utf-8"),
-                   file_name=f"ranking_proventos_{ano_sel}.csv",
-                   mime="text/csv")
+# =========================
+# TABELAS
+# =========================
+st.subheader("🔎 Auditoria linha a linha (planilha × cálculo)")
+cols_show = [
+    "ticker","data","tipo","quantidade","unitario_rs","irrf",
+    "total_liquido_orig_rs","total_liquido_calc_rs","diff_final_calc"
+]
+df_show = df_f[cols_show].sort_values("total_liquido_calc_rs", ascending=False)
+st.dataframe(df_show, use_container_width=True)
 
-st.caption("O app usa **Total_Final_R$** (planilha se existir; senão Qtd×Unitário−IRRF). Use a Auditoria para comparar com o total original.")
+st.subheader("📊 Soma por Ticker (valor oficial da planilha)")
+grp = df_f.groupby("ticker", dropna=True, as_index=False)["total_liquido_orig_rs"].sum()
+grp = grp.sort_values("total_liquido_orig_rs", ascending=False)
+st.dataframe(grp.rename(columns={"ticker":"Ticker","total_liquido_orig_rs":"Total Líquido (planilha)"}),
+             use_container_width=True)
